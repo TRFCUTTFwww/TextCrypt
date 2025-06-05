@@ -716,7 +716,6 @@ namespace TextCrypt
                 else if (mode == "V0")
                 {
                     kek = DeriveKeySHA512(passwordStr, 32);
-                    iv = GenerateRandomBytes(16); // For compatibility
                     cipherTextBytes = new byte[plaintextBytes.Length];
 
                     try
@@ -736,8 +735,8 @@ namespace TextCrypt
                         envelope = new EnvelopeData
                         {
                             V = "0",
-                            C = Convert.ToBase64String(cipherTextBytes),
-                            I = Convert.ToBase64String(iv) // Included for compatibility, not used in ECB
+                            C = Convert.ToBase64String(cipherTextBytes)
+                            // 移除 I 字段
                         };
 
                         string json = JsonSerializer.Serialize(envelope, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
@@ -746,16 +745,13 @@ namespace TextCrypt
 
                         debugInfo = DebugMode ? $@"加密参数 (核心直加密模式 V0):
 - KEK (Base64): {Convert.ToBase64String(kek)}
-- ECB IV (Base64, not used in ECB): {envelope.I}
 - Ciphertext (Base64): {envelope.C}
 - Shuffled Charset: {shuffledCharset}
 - Custom Base: {customBase}" : string.Empty;
-
-                        Array.Clear(iv, 0, iv.Length);
                     }
                     finally
                     {
-                        if (iv != null) Array.Clear(iv, 0, iv.Length);
+                        // 无需清除 iv
                     }
                 }
             }
@@ -1564,7 +1560,6 @@ namespace TextCrypt
                 }
                 else if (envelope.V == "0")
                 {
-                    // IV is present but not used in ECB
                     kek = DeriveKeySHA512(passwordStr, 32);
 
                     try
@@ -1584,7 +1579,6 @@ namespace TextCrypt
 
                         debugInfo = DebugMode ? $@"解密参数 (核心直加密模式 V0):
 - KEK (Base64): {Convert.ToBase64String(kek)}
-- ECB IV (Base64, not used in ECB): {envelope.I}
 - Ciphertext (Base64): {envelope.C}
 - Shuffled Charset: {shuffledCharset}
 - Custom Base: {customBase}" : string.Empty;
