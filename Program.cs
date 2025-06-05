@@ -41,7 +41,12 @@ namespace TextCrypt
             public int AI { get; set; } // Argon2 Iterations
             public int AP { get; set; } // Argon2 Parallelism
         }
-
+        class Config
+        {
+            public int MemorySizeKB { get; set; } = 1024 * 256; // 256MB
+            public int Iterations { get; set; } = 10; // 10 iterations
+            public int Parallelism { get; set; } = Environment.ProcessorCount;
+        }
         // ... (Config, Constants, LoadOrCreateConfig, SaveConfig, GeneratePasswordDerivedCharset, BytesToPasswordDerivedBaseString, PasswordDerivedBaseStringToBytes remain unchanged) ...
         private const int RANDOM_NONCE_LENGTH = 16; // For old mode
         private const string BaseAlphanumericCharset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
