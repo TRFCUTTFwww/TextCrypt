@@ -10,6 +10,7 @@ using System.IO;
 using System.Collections.Generic;
 using System.Linq;
 using Konscious.Security.Cryptography;
+using System.Text.Json.Serialization; // Added for JsonIgnoreCondition
 
 namespace TextCrypt
 {
@@ -27,9 +28,12 @@ namespace TextCrypt
         // Envelope for encrypted data
         class EnvelopeData
         {
-            public string V { get; set; } = "2"; // New mode default
+            public string V { get; set; } = "2"; // Default to "2" (Direct/New mode)
             public string S { get; set; } // Salt
-            public string K { get; set; } // Encrypted DEK + IV (old mode only)
+
+            [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] // Added
+            public string K { get; set; } // Encrypted DEK + IV (For V="1" Two-Layer/Old mode only)
+
             public string I { get; set; } // GCM IV
             public string C { get; set; } // Ciphertext
             public string T { get; set; } // GCM Tag
@@ -38,15 +42,7 @@ namespace TextCrypt
             public int AP { get; set; } // Argon2 Parallelism
         }
 
-        // Argon2 configuration
-        class Config
-        {
-            public int MemorySizeKB { get; set; } = 1024 * 256; // 256MB
-            public int Iterations { get; set; } = 10; // 10 iterations
-            public int Parallelism { get; set; } = Environment.ProcessorCount;
-        }
-
-        // Constants
+        // ... (Config, Constants, LoadOrCreateConfig, SaveConfig, GeneratePasswordDerivedCharset, BytesToPasswordDerivedBaseString, PasswordDerivedBaseStringToBytes remain unchanged) ...
         private const int RANDOM_NONCE_LENGTH = 16; // For old mode
         private const string BaseAlphanumericCharset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
         private static readonly string ConfigPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "textcrypt_config.json");
@@ -203,6 +199,7 @@ namespace TextCrypt
 
         static void RunInteractiveMode()
         {
+            // ... (Menu structure remains the same) ...
             while (true)
             {
                 Console.WriteLine("\n=== TextCrypt 文本加密解密工具 ===");
@@ -277,6 +274,7 @@ namespace TextCrypt
 
         static void EncryptInteractive()
         {
+            // ... (Input method selection and plaintext gathering remain the same) ...
             Console.WriteLine("\n=== 加密模式 ===");
             Console.WriteLine("请选择文本输入方式:");
             Console.WriteLine("1. 使用内置编辑器 (Terminal.Gui)");
@@ -387,12 +385,25 @@ namespace TextCrypt
                 return;
             }
 
+            // Updated mode selection
             Console.WriteLine("\n请选择加密模式:");
-            Console.WriteLine("1. 新模式 (默认，推荐) - 更安全，使用 AES-GCM，无填充攻击风险，密文较短");
-            Console.WriteLine("2. 旧模式 - 兼容旧密文，使用 AES-CBC 和 AES-GCM，存在填充攻击风险，密文较长");
-            Console.Write("请输入选择 (1/2, 默认1): ");
-            var modeChoice = Console.ReadLine();
-            bool useOldMode = modeChoice == "2";
+            Console.WriteLine("1. 双层加密 (主密钥加密数据密钥，数据密钥加密文本 - 对应旧模式V1架构)");
+            Console.WriteLine("2. 直接加密 (主密钥直接加密文本 - 对应新模式V2架构，推荐)");
+            Console.Write("请输入选项 (默认为 2): ");
+            string modeChoiceStr = Console.ReadLine()?.Trim();
+
+            bool useOldMode; // This corresponds to "双层加密 V1"
+            if (modeChoiceStr == "1")
+            {
+                useOldMode = true;
+            }
+            else
+            { // Includes "2", empty, or anything else for default
+                useOldMode = false;
+            }
+
+            string selectedModeName = useOldMode ? "双层加密 (旧V1架构)" : "直接加密 (新V2架构, 推荐)";
+            Console.WriteLine($"已选择: {selectedModeName}");
 
             Console.WriteLine("\n正在加密，这可能需要一些时间，请稍候...");
             var (encrypted, debugInfo) = EncryptText(plaintext, password, useOldMode);
@@ -404,6 +415,7 @@ namespace TextCrypt
                 Console.WriteLine(debugInfo);
             }
 
+            // ... (Output choice remains the same) ...
             Console.WriteLine("\n加密结果输出方式:");
             Console.WriteLine("1. 直接显示");
             Console.WriteLine("2. 保存到文件");
@@ -473,23 +485,23 @@ namespace TextCrypt
             byte[] salt = GenerateRandomBytes(16);
             byte[] kek = DeriveKeyFromPassword(password, salt, 32, argon2MemorySizeKB, argon2Iterations, argon2Parallelism);
             byte[] cipherTextBytes;
-            byte[] gcmTag = new byte[16];
-            byte[] gcmIv = GenerateRandomBytes(12);
+            byte[] gcmTag = new byte[16]; // AES-GCM standard tag size is 128 bits (16 bytes)
+            byte[] gcmIv = GenerateRandomBytes(12); // AES-GCM recommended IV size is 96 bits (12 bytes)
             EnvelopeData envelope;
             string debugInfo;
 
-            if (useOldMode)
+            if (useOldMode) // This is now "双层加密 (旧V1架构)"
             {
-                // Old mode: AES-CBC for DEK, AES-GCM for data, with nonce
-                byte[] dek = GenerateRandomBytes(32);
+                // Old mode (V1): AES-CBC for DEK, AES-GCM for data, with external nonce
+                byte[] dek = GenerateRandomBytes(32); // Data Encryption Key
                 byte[] encryptedDek;
-                byte[] dekIv = GenerateRandomBytes(16);
+                byte[] dekIv = GenerateRandomBytes(16); // IV for AES-CBC encryption of DEK
                 using (Aes aes = Aes.Create())
                 {
                     aes.KeySize = 256;
                     aes.Mode = CipherMode.CBC;
                     aes.Padding = PaddingMode.PKCS7;
-                    aes.Key = kek;
+                    aes.Key = kek; // KEK encrypts DEK
                     aes.IV = dekIv;
                     using (ICryptoTransform encryptor = aes.CreateEncryptor())
                     {
@@ -497,7 +509,7 @@ namespace TextCrypt
                     }
                 }
 
-                using (AesGcm aesGcm = new AesGcm(dek))
+                using (AesGcm aesGcm = new AesGcm(dek)) // DEK encrypts plaintext
                 {
                     byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
                     cipherTextBytes = new byte[plainBytes.Length];
@@ -506,10 +518,10 @@ namespace TextCrypt
 
                 envelope = new EnvelopeData
                 {
-                    V = "1",
+                    V = "1", // Version 1 for Two-Layer/Old mode
                     S = Convert.ToBase64String(salt),
-                    K = Convert.ToBase64String(encryptedDek) + ":" + Convert.ToBase64String(dekIv),
-                    I = Convert.ToBase64String(gcmIv),
+                    K = Convert.ToBase64String(encryptedDek) + ":" + Convert.ToBase64String(dekIv), // Encrypted DEK and its IV
+                    I = Convert.ToBase64String(gcmIv), // GCM IV for data encryption
                     C = Convert.ToBase64String(cipherTextBytes),
                     T = Convert.ToBase64String(gcmTag),
                     AM = argon2MemorySizeKB,
@@ -517,23 +529,28 @@ namespace TextCrypt
                     AP = argon2Parallelism
                 };
 
-                string json = JsonSerializer.Serialize(envelope);
+                // Serialize JSON envelope first
+                string json = JsonSerializer.Serialize(envelope, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
                 byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
-                byte[] nonce = GenerateRandomBytes(RANDOM_NONCE_LENGTH);
-                byte[] finalBytesToEncode = new byte[nonce.Length + jsonBytes.Length];
-                Buffer.BlockCopy(nonce, 0, finalBytesToEncode, 0, nonce.Length);
-                Buffer.BlockCopy(jsonBytes, 0, finalBytesToEncode, nonce.Length, jsonBytes.Length);
+
+                // Prepend the external random nonce for V1 mode
+                byte[] nonceForOldMode = GenerateRandomBytes(RANDOM_NONCE_LENGTH);
+                byte[] finalBytesToEncode = new byte[nonceForOldMode.Length + jsonBytes.Length];
+                Buffer.BlockCopy(nonceForOldMode, 0, finalBytesToEncode, 0, nonceForOldMode.Length);
+                Buffer.BlockCopy(jsonBytes, 0, finalBytesToEncode, nonceForOldMode.Length, jsonBytes.Length);
 
                 var (shuffledCharset, _, customBase) = GeneratePasswordDerivedCharset(password);
                 string encryptedText = BytesToPasswordDerivedBaseString(finalBytesToEncode, shuffledCharset, customBase);
 
-                debugInfo = DebugMode ? $@"加密参数 (旧模式):
-- DEK (Base64): {Convert.ToBase64String(dek)}
+                // Updated debug info name
+                debugInfo = DebugMode ? $@"加密参数 (双层加密 V1):
+- DEK (Base64): {Convert.ToBase64String(dek)} (Intermediate, not stored directly)
 - KEK (Base64): {Convert.ToBase64String(kek)}
 - Salt (Base64): {envelope.S}
-- DEK IV (Base64): {Convert.ToBase64String(dekIv)}
-- GCM IV (Base64): {envelope.I}
-- GCM Tag (Base64): {envelope.T}
+- DEK CBC IV (Base64): {Convert.ToBase64String(dekIv)} (Stored in K field)
+- Data GCM IV (Base64): {envelope.I}
+- Data GCM Tag (Base64): {envelope.T}
+- External Nonce (Base64, for V1 structure): {Convert.ToBase64String(nonceForOldMode)}
 - Argon2 Memory Size: {argon2MemorySizeKB} KB
 - Argon2 Iterations: {argon2Iterations}
 - Argon2 Parallelism: {argon2Parallelism}
@@ -542,10 +559,10 @@ namespace TextCrypt
 
                 return (encryptedText, debugInfo);
             }
-            else
+            else // This is "直接加密 (新V2架构)"
             {
-                // New mode: AES-GCM with KEK
-                using (AesGcm aesGcm = new AesGcm(kek))
+                // New mode (V2): AES-GCM with KEK directly encrypting data
+                using (AesGcm aesGcm = new AesGcm(kek)) // KEK encrypts plaintext
                 {
                     byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
                     cipherTextBytes = new byte[plainBytes.Length];
@@ -554,8 +571,9 @@ namespace TextCrypt
 
                 envelope = new EnvelopeData
                 {
-                    V = "2",
+                    V = "2", // Version 2 for Direct/New mode
                     S = Convert.ToBase64String(salt),
+                    // K is null and will be ignored by serializer due to JsonIgnoreCondition
                     I = Convert.ToBase64String(gcmIv),
                     C = Convert.ToBase64String(cipherTextBytes),
                     T = Convert.ToBase64String(gcmTag),
@@ -564,17 +582,19 @@ namespace TextCrypt
                     AP = argon2Parallelism
                 };
 
-                string json = JsonSerializer.Serialize(envelope);
+                // Serialize JSON envelope (no external nonce for V2)
+                string json = JsonSerializer.Serialize(envelope, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
                 byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
 
                 var (shuffledCharset, _, customBase) = GeneratePasswordDerivedCharset(password);
                 string encryptedText = BytesToPasswordDerivedBaseString(jsonBytes, shuffledCharset, customBase);
 
-                debugInfo = DebugMode ? $@"加密参数 (新模式):
+                // Updated debug info name
+                debugInfo = DebugMode ? $@"加密参数 (直接加密 V2):
 - KEK (Base64): {Convert.ToBase64String(kek)}
 - Salt (Base64): {envelope.S}
-- GCM IV (Base64): {envelope.I}
-- GCM Tag (Base64): {envelope.T}
+- Data GCM IV (Base64): {envelope.I}
+- Data GCM Tag (Base64): {envelope.T}
 - Argon2 Memory Size: {argon2MemorySizeKB} KB
 - Argon2 Iterations: {argon2Iterations}
 - Argon2 Parallelism: {argon2Parallelism}
@@ -602,11 +622,12 @@ namespace TextCrypt
                 Salt = salt,
                 DegreeOfParallelism = parallelism,
                 Iterations = iterations,
-                MemorySize = memorySizeKB
+                MemorySize = memorySizeKB // Konscious expects KiB
             };
             return argon2.GetBytes(keySize);
         }
 
+        // ... (SaveToDatabase, ChooseDatabaseFile, OpenEncryptedDatabase remain unchanged) ...
         static void SaveToDatabase(string cipherText)
         {
             Console.Write("\n请输入数据库文件名 (.db): ");
@@ -952,7 +973,7 @@ namespace TextCrypt
             } // End of outer loop (choosing DB file or returning to main menu)
         }
 
-
+        // ... (DecryptInteractive, DecryptWithPassword remain mostly unchanged, DecryptText needs debug string update) ...
         static void DecryptInteractive()
         {
             Console.WriteLine("\n解密文本来源:");
@@ -1094,40 +1115,40 @@ namespace TextCrypt
             }
 
             EnvelopeData envelope = null;
+            byte[] jsonPayloadToParse = null; // Will hold the bytes of the JSON part
+            bool isV1StructureWithNonce = false;
 
-            // Attempt 1: Treat decodedBytes as the direct JSON payload.
-            // This handles new mode (V2) and potentially old mode (V1) if it was encoded without a nonce.
+            // Attempt 1: Treat decodedBytes as the direct JSON payload (V2 or V1 without external nonce if it was ever possible).
             try
             {
                 string jsonString = Encoding.UTF8.GetString(decodedBytes);
-                var tempEnvelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString);
-                // Check for valid envelope structure (V must be "1" or "2")
-                if (tempEnvelope != null && !string.IsNullOrEmpty(tempEnvelope.V) &&
-                    (tempEnvelope.V == "1" || tempEnvelope.V == "2"))
+                var tempEnvelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+                if (tempEnvelope != null && !string.IsNullOrEmpty(tempEnvelope.V) && (tempEnvelope.V == "1" || tempEnvelope.V == "2"))
                 {
                     envelope = tempEnvelope;
+                    jsonPayloadToParse = decodedBytes; // This was the JSON
                 }
             }
             catch (Exception) { /* Swallow and try next method if this fails */ }
 
-            // Attempt 2: If Attempt 1 failed or didn't yield a recognized envelope,
-            // try assuming an old mode structure with a prepended nonce.
-            if (envelope == null && decodedBytes.Length >= RANDOM_NONCE_LENGTH)
+            // Attempt 2: If Attempt 1 failed, try assuming a V1 structure with a prepended external nonce.
+            if (envelope == null && decodedBytes.Length > RANDOM_NONCE_LENGTH)
             {
                 byte[] potentialJsonPayload = new byte[decodedBytes.Length - RANDOM_NONCE_LENGTH];
-                if (potentialJsonPayload.Length > 0) // Make sure there's something left after stripping nonce
+                if (potentialJsonPayload.Length > 0)
                 {
+                    // byte[] noncePart = new byte[RANDOM_NONCE_LENGTH]; // For debugging if needed
+                    // Buffer.BlockCopy(decodedBytes, 0, noncePart, 0, RANDOM_NONCE_LENGTH);
                     Buffer.BlockCopy(decodedBytes, RANDOM_NONCE_LENGTH, potentialJsonPayload, 0, potentialJsonPayload.Length);
                     try
                     {
                         string jsonString = Encoding.UTF8.GetString(potentialJsonPayload);
-                        var tempEnvelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString);
-                        // After stripping a nonce, we expect V="1" for old mode.
-                        // If V="2" is found here, it's an inconsistent state (new mode format with a nonce),
-                        // so we only accept V="1".
-                        if (tempEnvelope != null && tempEnvelope.V == "1")
+                        var tempEnvelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+                        if (tempEnvelope != null && tempEnvelope.V == "1") // Expect V="1" if an external nonce was stripped
                         {
                             envelope = tempEnvelope;
+                            jsonPayloadToParse = potentialJsonPayload; // This was the JSON
+                            isV1StructureWithNonce = true;
                         }
                     }
                     catch (Exception) { /* Swallow, envelope remains null if parsing fails */ }
@@ -1136,7 +1157,6 @@ namespace TextCrypt
 
             if (envelope == null)
             {
-                // This error message covers the user's reported issue and other parsing failures.
                 throw new Exception("解码后的数据无法识别为有效的加密格式 (JSON解析失败或版本不匹配)，可能是密码错误或密文损坏。");
             }
 
@@ -1145,11 +1165,9 @@ namespace TextCrypt
             {
                 salt = Convert.FromBase64String(envelope.S ?? throw new ArgumentNullException(nameof(envelope.S), "Salt 字段为空"));
             }
-            catch (FormatException ex)
-            {
-                throw new Exception("Salt 格式错误，可能密文损坏。", ex);
-            }
-            // Removed ArgumentNullException catch here as it's covered by the ?? throw pattern.
+            catch (FormatException ex) { throw new Exception("Salt 格式错误，可能密文损坏。", ex); }
+            catch (ArgumentNullException ex) { throw new Exception(ex.Message, ex); }
+
 
             int argon2MemorySizeKB = envelope.AM;
             int argon2Iterations = envelope.AI;
@@ -1171,28 +1189,33 @@ namespace TextCrypt
                 gcmIv = Convert.FromBase64String(envelope.I ?? throw new ArgumentNullException(nameof(envelope.I), "GCM IV 字段为空"));
                 gcmTag = Convert.FromBase64String(envelope.T ?? throw new ArgumentNullException(nameof(envelope.T), "GCM Tag 字段为空"));
             }
-            catch (FormatException ex)
-            {
-                throw new Exception("密文、IV 或 Tag 格式错误，可能密文损坏。", ex);
-            }
-            // Removed ArgumentNullException catch here as it's covered by the ?? throw pattern.
+            catch (FormatException ex) { throw new Exception("密文、IV 或 Tag 格式错误，可能密文损坏。", ex); }
+            catch (ArgumentNullException ex) { throw new Exception(ex.Message, ex); }
 
 
-            byte[] plainBytes = new byte[cipherTextBytes.Length];
+            byte[] plainBytes = new byte[cipherTextBytes.Length]; // AES-GCM output is same size as input
             string debugInfo;
-            string decryptedText; // Declare decryptedText outside the blocks
+            string decryptedText;
 
-            // The 'isOldMode' flag is removed; logic now directly uses envelope.V
-            if (envelope.V == "1")
+            if (envelope.V == "1") // 双层解密 V1
             {
-                // Old mode: Decrypt DEK with AES-CBC, then data with AES-GCM
                 byte[] encryptedDek;
                 byte[] dekIv;
+                byte[] dek = null; // Initialize to null for finally block
+                string externalNonceB64 = "N/A (Not applicable or not parsed)";
+                if (isV1StructureWithNonce && decodedBytes.Length > RANDOM_NONCE_LENGTH)
+                {
+                    byte[] noncePart = new byte[RANDOM_NONCE_LENGTH];
+                    Buffer.BlockCopy(decodedBytes, 0, noncePart, 0, RANDOM_NONCE_LENGTH);
+                    externalNonceB64 = Convert.ToBase64String(noncePart);
+                }
+
+
                 try
                 {
                     if (string.IsNullOrEmpty(envelope.K))
                     {
-                        throw new FormatException("旧模式密文缺少 K 字段 (加密的DEK和IV)。");
+                        throw new FormatException("双层加密(V1)密文缺少 K 字段 (加密的DEK和IV)。");
                     }
                     string[] keyParts = envelope.K.Split(':');
                     if (keyParts.Length != 2)
@@ -1200,19 +1223,15 @@ namespace TextCrypt
                     encryptedDek = Convert.FromBase64String(keyParts[0]);
                     dekIv = Convert.FromBase64String(keyParts[1]);
                 }
-                catch (FormatException ex)
-                {
-                    throw new Exception("旧模式的加密密钥(K)或其IV格式错误，可能密文损坏。", ex);
-                }
+                catch (FormatException ex) { throw new Exception("双层加密(V1)的加密密钥(K)或其IV格式错误，可能密文损坏。", ex); }
 
-                byte[] dek;
                 try
                 {
                     using (Aes aes = Aes.Create())
                     {
                         aes.KeySize = 256;
                         aes.Mode = CipherMode.CBC;
-                        aes.Padding = PaddingMode.PKCS7;
+                        aes.Padding = PaddingMode.PKCS7; // Ensure padding matches encryption
                         aes.Key = kek;
                         aes.IV = dekIv;
                         using (ICryptoTransform decryptor = aes.CreateDecryptor())
@@ -1221,10 +1240,7 @@ namespace TextCrypt
                         }
                     }
                 }
-                catch (CryptographicException ex)
-                {
-                    throw new Exception("DEK 解密失败，可能密码不正确或密文损坏。", ex);
-                }
+                catch (CryptographicException ex) { throw new Exception("DEK 解密失败 (V1)，可能密码不正确或密文损坏。", ex); }
 
                 try
                 {
@@ -1233,30 +1249,30 @@ namespace TextCrypt
                         aesGcm.Decrypt(gcmIv, cipherTextBytes, gcmTag, plainBytes, null);
                     }
                 }
-                catch (CryptographicException ex)
+                catch (CryptographicException ex) { throw new Exception("数据解密或认证失败 (V1)，可能密码不正确或密文已被篡改。", ex); }
+                finally
                 {
-                    throw new Exception("数据解密或认证失败 (旧模式)，可能密码不正确或密文已被篡改。", ex);
+                    if (dek != null) Array.Clear(dek, 0, dek.Length); // Clear DEK from memory
                 }
 
                 decryptedText = Encoding.UTF8.GetString(plainBytes);
-
-                debugInfo = DebugMode ? $@"解密参数 (旧模式):
-- DEK (Base64): {Convert.ToBase64String(dek)}
+                // Updated debug info name
+                debugInfo = DebugMode ? $@"解密参数 (双层加密 V1):
+- DEK (Base64): {(dek != null ? Convert.ToBase64String(dek) : "Error/NotAvailable")} (Intermediate)
 - KEK (Base64): {Convert.ToBase64String(kek)}
 - Salt (Base64): {envelope.S}
-- DEK IV (Base64): {Convert.ToBase64String(dekIv)}
-- GCM IV (Base64): {envelope.I}
-- GCM Tag (Base64): {envelope.T}
+- DEK CBC IV (Base64): {Convert.ToBase64String(dekIv)} (From K field)
+- Data GCM IV (Base64): {envelope.I}
+- Data GCM Tag (Base64): {envelope.T}
+- External Nonce (Base64, V1 structure): {externalNonceB64}
 - Argon2 Memory Size: {argon2MemorySizeKB} KB
 - Argon2 Iterations: {argon2Iterations}
 - Argon2 Parallelism: {argon2Parallelism}
 - Shuffled Charset: {shuffledCharset}
 - Custom Base: {customBase}" : string.Empty;
-
             }
-            else if (envelope.V == "2")
+            else if (envelope.V == "2") // 直接解密 V2
             {
-                // New mode: Decrypt data with AES-GCM using KEK
                 try
                 {
                     using (AesGcm aesGcm = new AesGcm(kek))
@@ -1264,18 +1280,15 @@ namespace TextCrypt
                         aesGcm.Decrypt(gcmIv, cipherTextBytes, gcmTag, plainBytes, null);
                     }
                 }
-                catch (CryptographicException ex)
-                {
-                    throw new Exception("数据解密或认证失败 (新模式)，可能密码不正确或密文已被篡改。", ex);
-                }
+                catch (CryptographicException ex) { throw new Exception("数据解密或认证失败 (V2)，可能密码不正确或密文已被篡改。", ex); }
 
                 decryptedText = Encoding.UTF8.GetString(plainBytes);
-
-                debugInfo = DebugMode ? $@"解密参数 (新模式):
+                // Updated debug info name
+                debugInfo = DebugMode ? $@"解密参数 (直接加密 V2):
 - KEK (Base64): {Convert.ToBase64String(kek)}
 - Salt (Base64): {envelope.S}
-- GCM IV (Base64): {envelope.I}
-- GCM Tag (Base64): {envelope.T}
+- Data GCM IV (Base64): {envelope.I}
+- Data GCM Tag (Base64): {envelope.T}
 - Argon2 Memory Size: {argon2MemorySizeKB} KB
 - Argon2 Iterations: {argon2Iterations}
 - Argon2 Parallelism: {argon2Parallelism}
@@ -1286,6 +1299,12 @@ namespace TextCrypt
             {
                 throw new Exception($"不支持的密文版本: {envelope.V}");
             }
+
+            // Clear KEK from memory
+            if (kek != null) Array.Clear(kek, 0, kek.Length);
+            // Clear plaintext bytes if still held
+            if (plainBytes != null) Array.Clear(plainBytes, 0, plainBytes.Length);
+
             return (decryptedText, debugInfo);
         }
 
@@ -1299,12 +1318,17 @@ namespace TextCrypt
                 Console.WriteLine("  textcrypt encryptfile <input_file_path> <output_file_path> <password> [old]");
                 Console.WriteLine("  textcrypt decryptfile <input_file_path> <output_file_path> <password>");
                 Console.WriteLine("  textcrypt help | --help | -h");
-                Console.WriteLine("  注意: 添加 'old' 参数使用旧加密模式（不推荐）。");
+                // Updated help text for [old] flag
+                Console.WriteLine("  注意: 添加 'old' 参数使用“双层加密 (旧V1架构)”模式。默认为“直接加密 (新V2架构)”。");
                 return;
             }
 
             var command = args[0].ToLower();
-            bool useOldMode = args.Length > 3 && args[args.Length - 1].ToLower() == "old";
+            // useOldMode is true if the LAST argument is "old" (and there are enough args for it to be a mode flag)
+            bool useOldMode = args.Length >= (command.Contains("file") ? 5 : 4) && args[args.Length - 1].ToLower() == "old";
+            // Determine the actual password argument index based on whether 'old' is present
+            int passwordArgIndex = command.Contains("file") ? 3 : 2;
+
 
             try
             {
@@ -1313,7 +1337,7 @@ namespace TextCrypt
                     case "encrypt":
                         if (args.Length < 3) throw new ArgumentException("参数不足: textcrypt encrypt <text> <password> [old]");
                         Console.Error.WriteLine("正在加密...");
-                        var (encrypted, debugEnc) = EncryptText(args[1], args[2], useOldMode);
+                        var (encrypted, debugEnc) = EncryptText(args[1], args[passwordArgIndex], useOldMode);
                         if (DebugMode) Console.Error.WriteLine(debugEnc);
                         Console.WriteLine(encrypted);
                         break;
@@ -1321,6 +1345,7 @@ namespace TextCrypt
                     case "decrypt":
                         if (args.Length < 3) throw new ArgumentException("参数不足: textcrypt decrypt <encrypted_text> <password>");
                         Console.Error.WriteLine("正在解密...");
+                        // DecryptText doesn't take useOldMode; it determines from cipher V field
                         var (decrypted, debugDec) = DecryptText(args[1], args[2]);
                         if (DebugMode) Console.Error.WriteLine(debugDec);
                         Console.WriteLine(decrypted);
@@ -1330,7 +1355,7 @@ namespace TextCrypt
                         if (args.Length < 4) throw new ArgumentException("参数不足: textcrypt encryptfile <inputfile> <outputfile> <password> [old]");
                         var text = File.ReadAllText(args[1]);
                         Console.Error.WriteLine("正在加密文件...");
-                        var (encResult, debugEncFile) = EncryptText(text, args[3], useOldMode);
+                        var (encResult, debugEncFile) = EncryptText(text, args[passwordArgIndex], useOldMode);
                         if (DebugMode) Console.Error.WriteLine(debugEncFile);
                         File.WriteAllText(args[2], encResult);
                         Console.WriteLine($"加密完成: {args[2]}");
@@ -1340,6 +1365,7 @@ namespace TextCrypt
                         if (args.Length < 4) throw new ArgumentException("参数不足: textcrypt decryptfile <inputfile> <outputfile> <password>");
                         var encText = File.ReadAllText(args[1]);
                         Console.Error.WriteLine("正在解密文件...");
+                        // DecryptText doesn't take useOldMode
                         var (decResult, debugDecFile) = DecryptText(encText, args[3]);
                         if (DebugMode) Console.Error.WriteLine(debugDecFile);
                         File.WriteAllText(args[2], decResult);
@@ -1355,9 +1381,12 @@ namespace TextCrypt
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"错误: {ex.Message}");
+                if (DebugMode && ex.InnerException != null) Console.Error.WriteLine($"内部错误: {ex.InnerException.Message}");
+                if (DebugMode && ex.StackTrace != null) Console.Error.WriteLine($"堆栈跟踪: {ex.StackTrace}");
             }
         }
 
+        // ... (ReadMultilineInputAdvanced, GenerateHMAC_SHA512, ModifyArgon2Parameters remain unchanged) ...
         static string ReadMultilineInputAdvanced()
         {
             Application.Init();
