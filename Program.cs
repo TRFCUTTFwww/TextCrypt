@@ -100,22 +100,46 @@ namespace TextCrypt
         // Generate password-derived charset for encoding
         private static (string shuffledCharset, Dictionary<char, int> charToValueMap, int customBase) GeneratePasswordDerivedCharset(string password)
         {
+            // 1. 计算 SHA-512 哈希（64 字节）
             byte[] passwordBytes = Encoding.UTF8.GetBytes(password);
             byte[] hashBytes;
             using (var sha512 = SHA512.Create())
             {
-                hashBytes = sha512.ComputeHash(passwordBytes);
+                hashBytes = sha512.ComputeHash(passwordBytes); // 64 字节的哈希结果
             }
-            int seed = BitConverter.ToInt32(hashBytes, 0);
-            var list = BaseAlphanumericCharset.ToList();
-            var random = new Random(seed);
-            var shuffledCharset = new string(list.OrderBy(x => random.Next()).ToArray());
-            var charToValueMap = new Dictionary<char, int>();
-            for (int i = 0; i < shuffledCharset.Length; i++)
+
+            // 2. 准备原始字符集（假设 BaseAlphanumericCharset 已定义，如 "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"）
+            char[] charsetArray = BaseAlphanumericCharset.ToCharArray();
+            int n = charsetArray.Length;
+
+            // 3. 使用 Fisher–Yates 洗牌算法，结合 hashBytes 作为“随机源”，保证对同一密码始终生成相同排列
+            //    采用循环读取 hashBytes，当字节用完后继续从头循环。
+            int hashIndex = 0;
+            for (int i = n - 1; i > 0; i--)
+            {
+                // 取当前 hashBytes 中的一字节，转换为 0 到 i 之间的索引
+                byte b = hashBytes[hashIndex];
+                int j = b % (i + 1);
+
+                // 交换位置 i 与 j 的字符
+                char tmp = charsetArray[i];
+                charsetArray[i] = charsetArray[j];
+                charsetArray[j] = tmp;
+
+                // 移动到下一个哈希字节，若到末尾则回到开头
+                hashIndex = (hashIndex + 1) % hashBytes.Length;
+            }
+
+            // 4. 生成打乱后的字符集字符串，以及字符到数值的映射
+            string shuffledCharset = new string(charsetArray);
+            var charToValueMap = new Dictionary<char, int>(n);
+            for (int i = 0; i < n; i++)
             {
                 charToValueMap[shuffledCharset[i]] = i;
             }
-            return (shuffledCharset, charToValueMap, shuffledCharset.Length);
+
+            // customBase 即字符集长度
+            return (shuffledCharset, charToValueMap, n);
         }
 
         // Encode bytes to custom base string
