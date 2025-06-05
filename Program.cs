@@ -207,7 +207,8 @@ namespace TextCrypt
         {
             while (true)
             {
-                Console.WriteLine("\n=== TextCrypt 文本加密解密工具 ===");
+                Console.WriteLine("\n=== TextCrypt ===");
+                Console.WriteLine("便捷文本加密解密工具");
                 Console.WriteLine($"调试模式: {(DebugMode ? "开启" : "关闭")}");
                 Console.WriteLine($"当前 Argon2 参数 - 内存: {CurrentConfig.MemorySizeKB} KB, 迭代: {CurrentConfig.Iterations}, 并行: {CurrentConfig.Parallelism}");
                 Console.WriteLine("请选择操作:");
@@ -393,10 +394,10 @@ namespace TextCrypt
                         }
 
                         Console.WriteLine("\n请选择加密模式:");
-                        Console.WriteLine("1. 双层加密 (主密钥加密数据密钥，数据密钥加密文本 - 旧V1架构)");
+                        Console.WriteLine("1. 双层加密 (主密钥加密数据密钥，数据密钥加密文本 - 旧V1架构) 长密文");
                         Console.WriteLine("2. 直接加密 (主密钥直接加密文本 - 新V2架构，推荐)");
-                        Console.WriteLine("3. 盐值随机模式 (仅用盐值增加随机性，AES-256-ECB加密 - V0.5)");
-                        Console.WriteLine("4. 核心直加密模式 (无盐值，确定性加密，AES-256-ECB - V0)");
+                        Console.WriteLine("3. 盐值随机模式 (仅用盐值增加随机性，AES-256-ECB加密 - V0.5) 密文稍短于V2");
+                        Console.WriteLine("4. 核心直加密模式 (无盐值，确定性加密，AES-256-ECB - V0) 密文最短，同一密码同一明文下，密文也同一");
                         Console.Write("请输入选项 (默认为 2): ");
                         string modeChoiceStr = Console.ReadLine()?.Trim();
 
