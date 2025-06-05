@@ -55,6 +55,30 @@ namespace TextCrypt
         private static bool DebugMode = false;
 
         // Load or create configuration
+        private static byte[] DeriveKeyFromPasswordDirectHash(string password)
+        {
+            byte[] passwordBytes = Encoding.UTF8.GetBytes(password);
+            using (var sha512 = SHA512.Create())
+            {
+                byte[] fullHash = sha512.ComputeHash(passwordBytes); // 64-byte hash
+                byte[] key = new byte[32]; // AES-256 key size
+                Buffer.BlockCopy(fullHash, 0, key, 0, 32); // Take the first 32 bytes
+                Array.Clear(fullHash, 0, fullHash.Length); // Clear the full hash from memory
+                return key;
+            }
+            // passwordBytes will be garbage collected.
+        }
+
+        private static byte[] DeriveDeterministicIV(byte[] plaintextBytes)
+        {
+            using (var sha256 = SHA256.Create())
+            {
+                byte[] hash = sha256.ComputeHash(plaintextBytes);
+                byte[] iv = new byte[12]; // GCM IV size
+                Buffer.BlockCopy(hash, 0, iv, 0, 12);
+                return iv;
+            }
+        }
         private static Config LoadOrCreateConfig()
         {
             if (File.Exists(ConfigPath))
@@ -84,6 +108,21 @@ namespace TextCrypt
             }
         }
 
+        private static bool IsUTF8(byte[] bytes)
+        {
+            // A quick check, not a full validation
+            try
+            {
+                Encoding.UTF8.GetString(bytes);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static bool IsASCII(byte[] bytes)
+        {
+            return bytes.All(b => b >= 0 && b <= 127);
+        }
         private static void SaveConfig()
         {
             try
@@ -481,134 +520,191 @@ namespace TextCrypt
             return password.ToString();
         }
 
-        static (string encryptedText, string debugInfo) EncryptText(string plainText, string password, bool useOldMode)
+        static (string encryptedText, string debugInfo) EncryptText(string plainText, string password, bool useOldModeV1, string specialMode = null)
         {
+            // Argon2 KDF parameters for V1/V2, loaded from CurrentConfig
             int argon2MemorySizeKB = CurrentConfig.MemorySizeKB;
             int argon2Iterations = CurrentConfig.Iterations;
             int argon2Parallelism = CurrentConfig.Parallelism;
 
-            byte[] salt = GenerateRandomBytes(16);
-            byte[] kek = DeriveKeyFromPassword(password, salt, 32, argon2MemorySizeKB, argon2Iterations, argon2Parallelism);
+            byte[] salt; // Used for V1/V2 KDF, or as appended salt for V0.5
+            byte[] encryptionKey = null; // The actual key used for AES-GCM encryption
             byte[] cipherTextBytes;
-            byte[] gcmTag = new byte[16]; // AES-GCM standard tag size is 128 bits (16 bytes)
-            byte[] gcmIv = GenerateRandomBytes(12); // AES-GCM recommended IV size is 96 bits (12 bytes)
+            byte[] gcmTag = new byte[16];
+            byte[] gcmIv;
             EnvelopeData envelope;
-            string debugInfo;
+            string debugInfoBuilder = string.Empty;
 
-            if (useOldMode) // This is now "双层加密 (旧V1架构)"
+            try
             {
-                // Old mode (V1): AES-CBC for DEK, AES-GCM for data, with external nonce
-                byte[] dek = GenerateRandomBytes(32); // Data Encryption Key
-                byte[] encryptedDek;
-                byte[] dekIv = GenerateRandomBytes(16); // IV for AES-CBC encryption of DEK
-                using (Aes aes = Aes.Create())
+                if (specialMode == "0.5") // Salt Append Mode (Key: First 32 bytes of SHA512(password))
                 {
-                    aes.KeySize = 256;
-                    aes.Mode = CipherMode.CBC;
-                    aes.Padding = PaddingMode.PKCS7;
-                    aes.Key = kek; // KEK encrypts DEK
-                    aes.IV = dekIv;
-                    using (ICryptoTransform encryptor = aes.CreateEncryptor())
+                    encryptionKey = DeriveKeyFromPasswordDirectHash(password);
+                    salt = GenerateRandomBytes(16); // This is S_mode0.5, appended, not used for KDF
+                    gcmIv = GenerateRandomBytes(12);
+
+                    using (AesGcm aesGcm = new AesGcm(encryptionKey))
                     {
-                        encryptedDek = encryptor.TransformFinalBlock(dek, 0, dek.Length);
+                        byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
+                        cipherTextBytes = new byte[plainBytes.Length];
+                        aesGcm.Encrypt(gcmIv, plainBytes, cipherTextBytes, gcmTag, null);
+                        Array.Clear(plainBytes, 0, plainBytes.Length); // Clear plaintext from memory
+                    }
+
+                    envelope = new EnvelopeData
+                    {
+                        V = "0.5",
+                        S = Convert.ToBase64String(salt), // Appended salt
+                        I = Convert.ToBase64String(gcmIv),
+                        C = Convert.ToBase64String(cipherTextBytes),
+                        T = Convert.ToBase64String(gcmTag)
+                    };
+
+                    debugInfoBuilder = DebugMode ? $@"加密参数 (盐值附加模式 V0.5):
+- Encryption Key (Base64, SHA512(password) 前32字节): {Convert.ToBase64String(encryptionKey)}
+- Appended Salt (Base64, S field): {envelope.S}
+- Data GCM IV (Base64): {envelope.I}
+- Data GCM Tag (Base64): {envelope.T}
+警告: 此模式密钥直接由密码SHA512哈希的前32字节生成，安全性依赖于密码强度。" : string.Empty;
+                }
+                else if (specialMode == "0") // Basic Core Mode (Deterministic, Key: First 32 bytes of SHA512(password))
+                {
+                    encryptionKey = DeriveKeyFromPasswordDirectHash(password);
+                    byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
+                    gcmIv = DeriveDeterministicIV(plainBytes); // Deterministic IV based on plaintext hash
+
+                    using (AesGcm aesGcm = new AesGcm(encryptionKey))
+                    {
+                        cipherTextBytes = new byte[plainBytes.Length];
+                        aesGcm.Encrypt(gcmIv, plainBytes, cipherTextBytes, gcmTag, null);
+                    }
+                    Array.Clear(plainBytes, 0, plainBytes.Length); // Clear plaintext from memory
+
+                    envelope = new EnvelopeData
+                    {
+                        V = "0",
+                        I = Convert.ToBase64String(gcmIv),
+                        C = Convert.ToBase64String(cipherTextBytes),
+                        T = Convert.ToBase64String(gcmTag)
+                    };
+
+                    debugInfoBuilder = DebugMode ? $@"加密参数 (基础核心模式 V0 - 确定性):
+- Encryption Key (Base64, SHA512(password) 前32字节): {Convert.ToBase64String(encryptionKey)}
+- Data GCM IV (Base64, Deterministic from Plaintext): {envelope.I}
+- Data GCM Tag (Base64): {envelope.T}
+警告: 此模式为确定性加密，密钥直接由密码SHA512哈希的前32字节生成。相同密码和明文将产生相同密文。请注意相关安全影响。" : string.Empty;
+                }
+                else if (useOldModeV1) // V1: 双层加密 (Argon2 KDF)
+                {
+                    salt = GenerateRandomBytes(16);
+                    byte[] kek_v1 = DeriveKeyFromPassword(password, salt, 32, argon2MemorySizeKB, argon2Iterations, argon2Parallelism); // KEK for V1
+                    encryptionKey = kek_v1; // Store kek_v1 for final clearing
+                    byte[] dek = null; // Data Encryption Key
+                    try
+                    {
+                        dek = GenerateRandomBytes(32); // Randomly generated DEK
+                        byte[] encryptedDek;
+                        byte[] dekIv = GenerateRandomBytes(16); // IV for DEK encryption (CBC)
+
+                        using (Aes aes = Aes.Create())
+                        {
+                            aes.KeySize = 256; aes.Mode = CipherMode.CBC; aes.Padding = PaddingMode.PKCS7;
+                            aes.Key = kek_v1; // Use KEK to encrypt DEK
+                            aes.IV = dekIv;
+                            using (ICryptoTransform encryptor = aes.CreateEncryptor())
+                            {
+                                encryptedDek = encryptor.TransformFinalBlock(dek, 0, dek.Length);
+                            }
+                        }
+
+                        gcmIv = GenerateRandomBytes(12); // IV for data encryption (GCM)
+                        using (AesGcm aesGcm = new AesGcm(dek)) // Use DEK for data encryption
+                        {
+                            byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
+                            cipherTextBytes = new byte[plainBytes.Length];
+                            aesGcm.Encrypt(gcmIv, plainBytes, cipherTextBytes, gcmTag, null);
+                            Array.Clear(plainBytes, 0, plainBytes.Length); // Clear plaintext from memory
+                        }
+
+                        envelope = new EnvelopeData
+                        {
+                            V = "1",
+                            S = Convert.ToBase64String(salt), // KDF salt for KEK
+                            K = Convert.ToBase64String(encryptedDek) + ":" + Convert.ToBase64String(dekIv), // Encrypted DEK and its IV
+                            I = Convert.ToBase64String(gcmIv), // Data GCM IV
+                            C = Convert.ToBase64String(cipherTextBytes), // Ciphertext
+                            T = Convert.ToBase64String(gcmTag), // GCM Tag
+                            AM = argon2MemorySizeKB,
+                            AI = argon2Iterations,
+                            AP = argon2Parallelism
+                        };
+                        debugInfoBuilder = DebugMode ? $@"加密参数 (双层加密 V1):
+- DEK (Base64): {Convert.ToBase64String(dek)} (Intermediate)
+- KEK (Base64, from Argon2id): {Convert.ToBase64String(kek_v1)}
+- Salt (Base64): {envelope.S}
+- DEK CBC IV (Base64): {Convert.ToBase64String(dekIv)}
+- Data GCM IV (Base64): {envelope.I}
+- Data GCM Tag (Base64): {envelope.T}
+- Argon2 Memory Size: {argon2MemorySizeKB} KB, Iterations: {argon2Iterations}, Parallelism: {argon2Parallelism}" : string.Empty;
+                    }
+                    finally
+                    {
+                        if (dek != null) Array.Clear(dek, 0, dek.Length); // Clear DEK from memory
                     }
                 }
-
-                using (AesGcm aesGcm = new AesGcm(dek)) // DEK encrypts plaintext
+                else // V2: 直接加密 (Argon2 KDF) - default mode
                 {
-                    byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
-                    cipherTextBytes = new byte[plainBytes.Length];
-                    aesGcm.Encrypt(gcmIv, plainBytes, cipherTextBytes, gcmTag, null);
-                }
+                    salt = GenerateRandomBytes(16); // KDF salt for encryptionKey
+                    encryptionKey = DeriveKeyFromPassword(password, salt, 32, argon2MemorySizeKB, argon2Iterations, argon2Parallelism);
+                    gcmIv = GenerateRandomBytes(12);
 
-                envelope = new EnvelopeData
-                {
-                    V = "1", // Version 1 for Two-Layer/Old mode
-                    S = Convert.ToBase64String(salt),
-                    K = Convert.ToBase64String(encryptedDek) + ":" + Convert.ToBase64String(dekIv), // Encrypted DEK and its IV
-                    I = Convert.ToBase64String(gcmIv), // GCM IV for data encryption
-                    C = Convert.ToBase64String(cipherTextBytes),
-                    T = Convert.ToBase64String(gcmTag),
-                    AM = argon2MemorySizeKB,
-                    AI = argon2Iterations,
-                    AP = argon2Parallelism
-                };
+                    using (AesGcm aesGcm = new AesGcm(encryptionKey))
+                    {
+                        byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
+                        cipherTextBytes = new byte[plainBytes.Length];
+                        aesGcm.Encrypt(gcmIv, plainBytes, cipherTextBytes, gcmTag, null);
+                        Array.Clear(plainBytes, 0, plainBytes.Length); // Clear plaintext from memory
+                    }
 
-                // Serialize JSON envelope first
-                string json = JsonSerializer.Serialize(envelope, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
-                byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
-
-                // Prepend the external random nonce for V1 mode
-                byte[] nonceForOldMode = GenerateRandomBytes(RANDOM_NONCE_LENGTH);
-                byte[] finalBytesToEncode = new byte[nonceForOldMode.Length + jsonBytes.Length];
-                Buffer.BlockCopy(nonceForOldMode, 0, finalBytesToEncode, 0, nonceForOldMode.Length);
-                Buffer.BlockCopy(jsonBytes, 0, finalBytesToEncode, nonceForOldMode.Length, jsonBytes.Length);
-
-                var (shuffledCharset, _, customBase) = GeneratePasswordDerivedCharset(password);
-                string encryptedText = BytesToPasswordDerivedBaseString(finalBytesToEncode, shuffledCharset, customBase);
-
-                // Updated debug info name
-                debugInfo = DebugMode ? $@"加密参数 (双层加密 V1):
-- DEK (Base64): {Convert.ToBase64String(dek)} (Intermediate, not stored directly)
-- KEK (Base64): {Convert.ToBase64String(kek)}
+                    envelope = new EnvelopeData
+                    {
+                        V = "2",
+                        S = Convert.ToBase64String(salt), // KDF salt for encryptionKey
+                        I = Convert.ToBase64String(gcmIv), // Data GCM IV
+                        C = Convert.ToBase64String(cipherTextBytes), // Ciphertext
+                        T = Convert.ToBase64String(gcmTag), // GCM Tag
+                        AM = argon2MemorySizeKB,
+                        AI = argon2Iterations,
+                        AP = argon2Parallelism
+                    };
+                    debugInfoBuilder = DebugMode ? $@"加密参数 (直接加密 V2):
+- Encryption Key (Base64, from Argon2id): {Convert.ToBase64String(encryptionKey)}
 - Salt (Base64): {envelope.S}
-- DEK CBC IV (Base64): {Convert.ToBase64String(dekIv)} (Stored in K field)
 - Data GCM IV (Base64): {envelope.I}
 - Data GCM Tag (Base64): {envelope.T}
-- External Nonce (Base64, for V1 structure): {Convert.ToBase64String(nonceForOldMode)}
-- Argon2 Memory Size: {argon2MemorySizeKB} KB
-- Argon2 Iterations: {argon2Iterations}
-- Argon2 Parallelism: {argon2Parallelism}
-- Shuffled Charset: {shuffledCharset}
-- Custom Base: {customBase}" : string.Empty;
+- Argon2 Memory Size: {argon2MemorySizeKB} KB, Iterations: {argon2Iterations}, Parallelism: {argon2Parallelism}" : string.Empty;
+                }
 
-                return (encryptedText, debugInfo);
+                // Serialize envelope to JSON and then to custom Base64 string
+                string jsonString = JsonSerializer.Serialize(envelope);
+                string encryptedTextResult = Convert.ToBase64String(Encoding.UTF8.GetBytes(jsonString));
+
+                // Append custom encoding for better readability/less ambiguity
+                encryptedTextResult = "tc_v1_" + encryptedTextResult;
+
+                return (encryptedTextResult, debugInfoBuilder);
             }
-            else // This is "直接加密 (新V2架构)"
+            catch (Exception ex)
             {
-                // New mode (V2): AES-GCM with KEK directly encrypting data
-                using (AesGcm aesGcm = new AesGcm(kek)) // KEK encrypts plaintext
-                {
-                    byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
-                    cipherTextBytes = new byte[plainBytes.Length];
-                    aesGcm.Encrypt(gcmIv, plainBytes, cipherTextBytes, gcmTag, null);
-                }
-
-                envelope = new EnvelopeData
-                {
-                    V = "2", // Version 2 for Direct/New mode
-                    S = Convert.ToBase64String(salt),
-                    // K is null and will be ignored by serializer due to JsonIgnoreCondition
-                    I = Convert.ToBase64String(gcmIv),
-                    C = Convert.ToBase64String(cipherTextBytes),
-                    T = Convert.ToBase64String(gcmTag),
-                    AM = argon2MemorySizeKB,
-                    AI = argon2Iterations,
-                    AP = argon2Parallelism
-                };
-
-                // Serialize JSON envelope (no external nonce for V2)
-                string json = JsonSerializer.Serialize(envelope, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
-                byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
-
-                var (shuffledCharset, _, customBase) = GeneratePasswordDerivedCharset(password);
-                string encryptedText = BytesToPasswordDerivedBaseString(jsonBytes, shuffledCharset, customBase);
-
-                // Updated debug info name
-                debugInfo = DebugMode ? $@"加密参数 (直接加密 V2):
-- KEK (Base64): {Convert.ToBase64String(kek)}
-- Salt (Base64): {envelope.S}
-- Data GCM IV (Base64): {envelope.I}
-- Data GCM Tag (Base64): {envelope.T}
-- Argon2 Memory Size: {argon2MemorySizeKB} KB
-- Argon2 Iterations: {argon2Iterations}
-- Argon2 Parallelism: {argon2Parallelism}
-- Shuffled Charset: {shuffledCharset}
-- Custom Base: {customBase}" : string.Empty;
-
-                return (encryptedText, debugInfo);
+                // Rethrow with more context or log error
+                throw new Exception($"加密失败: {ex.Message}", ex);
+            }
+            finally
+            {
+                if (encryptionKey != null) Array.Clear(encryptionKey, 0, encryptionKey.Length); // Clear the key from memory
             }
         }
+
 
         static byte[] GenerateRandomBytes(int length)
         {
@@ -1108,209 +1204,200 @@ namespace TextCrypt
 
         static (string decryptedText, string debugInfo) DecryptText(string encryptedCustomBaseString, string password)
         {
-            var (shuffledCharset, charToValueMap, customBase) = GeneratePasswordDerivedCharset(password);
-            byte[] decodedBytes;
+            if (string.IsNullOrEmpty(encryptedCustomBaseString))
+                throw new ArgumentException("待解密文本不能为空。", nameof(encryptedCustomBaseString));
+            if (string.IsNullOrEmpty(password))
+                throw new ArgumentException("解密密码不能为空。", nameof(password));
+
+            // Remove custom encoding prefix
+            if (!encryptedCustomBaseString.StartsWith("tc_v1_"))
+                throw new FormatException("加密文本格式不正确，缺少 'tc_v1_' 前缀。");
+            string base64Json = encryptedCustomBaseString.Substring("tc_v1_".Length);
+
+            EnvelopeData envelope;
             try
             {
-                decodedBytes = PasswordDerivedBaseStringToBytes(encryptedCustomBaseString, shuffledCharset, charToValueMap, customBase);
+                byte[] jsonBytes = Convert.FromBase64String(base64Json);
+                string jsonString = Encoding.UTF8.GetString(jsonBytes);
+                envelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString);
             }
             catch (FormatException ex)
             {
-                throw new Exception("密文格式无效或密码不正确 (自定义编码解码失败)。", ex);
+                throw new Exception("Base64 或 JSON 格式错误，可能密文已损坏或被篡改。", ex);
+            }
+            catch (JsonException ex)
+            {
+                throw new Exception("JSON 数据解析失败，可能密文已损坏或被篡改。", ex);
+            }
+            catch (Exception ex)
+            {
+                throw new Exception($"密文解析初始阶段发生错误: {ex.Message}", ex);
             }
 
-            EnvelopeData envelope = null;
-            byte[] jsonPayloadToParse = null; // Will hold the bytes of the JSON part
-            bool isV1StructureWithNonce = false;
+            byte[] saltFromEnvelope = null;
+            if (!string.IsNullOrEmpty(envelope.S))
+            {
+                try { saltFromEnvelope = Convert.FromBase64String(envelope.S); }
+                catch (FormatException ex) { throw new Exception("Salt 格式错误 (S字段)，可能密文损坏。", ex); }
+            }
 
-            // Attempt 1: Treat decodedBytes as the direct JSON payload (V2 or V1 without external nonce if it was ever possible).
+            byte[] decryptionKey = null; // The key used for AES-GCM decryption
+            byte[] plainBytes = null; // To hold the decrypted plaintext bytes
+            string decryptedTextResult;
+            string debugInfoResult = string.Empty;
+
             try
             {
-                string jsonString = Encoding.UTF8.GetString(decodedBytes);
-                var tempEnvelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
-                if (tempEnvelope != null && !string.IsNullOrEmpty(tempEnvelope.V) && (tempEnvelope.V == "1" || tempEnvelope.V == "2"))
-                {
-                    envelope = tempEnvelope;
-                    jsonPayloadToParse = decodedBytes; // This was the JSON
-                }
-            }
-            catch (Exception) { /* Swallow and try next method if this fails */ }
+                // Common fields for all modes (C, I, T)
+                byte[] cipherTextFromEnvelope = Convert.FromBase64String(envelope.C ?? throw new ArgumentNullException(nameof(envelope.C), "CipherText (C) 字段为空"));
+                byte[] gcmIvFromEnvelope = Convert.FromBase64String(envelope.I ?? throw new ArgumentNullException(nameof(envelope.I), "GCM IV (I) 字段为空"));
+                byte[] gcmTagFromEnvelope = Convert.FromBase64String(envelope.T ?? throw new ArgumentNullException(nameof(envelope.T), "GCM Tag (T) 字段为空"));
+                plainBytes = new byte[cipherTextFromEnvelope.Length]; // Initialize to ciphertext length
 
-            // Attempt 2: If Attempt 1 failed, try assuming a V1 structure with a prepended external nonce.
-            if (envelope == null && decodedBytes.Length > RANDOM_NONCE_LENGTH)
-            {
-                byte[] potentialJsonPayload = new byte[decodedBytes.Length - RANDOM_NONCE_LENGTH];
-                if (potentialJsonPayload.Length > 0)
+                if (envelope.V == "0.5") // Salt Append Mode (Key: First 32 bytes of SHA512(password))
                 {
-                    // byte[] noncePart = new byte[RANDOM_NONCE_LENGTH]; // For debugging if needed
-                    // Buffer.BlockCopy(decodedBytes, 0, noncePart, 0, RANDOM_NONCE_LENGTH);
-                    Buffer.BlockCopy(decodedBytes, RANDOM_NONCE_LENGTH, potentialJsonPayload, 0, potentialJsonPayload.Length);
+                    decryptionKey = DeriveKeyFromPasswordDirectHash(password);
+                    // saltFromEnvelope (envelope.S) is the appended salt, not used for KDF here.
+                    using (AesGcm aesGcm = new AesGcm(decryptionKey))
+                    {
+                        aesGcm.Decrypt(gcmIvFromEnvelope, cipherTextFromEnvelope, gcmTagFromEnvelope, plainBytes, null);
+                    }
+                    decryptedTextResult = Encoding.UTF8.GetString(plainBytes);
+                    debugInfoResult = DebugMode ? $@"解密参数 (盐值附加模式 V0.5):
+- Decryption Key (Base64, SHA512(password) 前32字节): {Convert.ToBase64String(decryptionKey)}
+- Appended Salt (Base64, from S field): {envelope.S}
+- Data GCM IV (Base64): {envelope.I}
+- Data GCM Tag (Base64): {envelope.T}
+警告: 此模式密钥直接由密码SHA512哈希的前32字节生成。" : string.Empty;
+                }
+                else if (envelope.V == "0") // Basic Core Mode (Deterministic, Key: First 32 bytes of SHA512(password))
+                {
+                    decryptionKey = DeriveKeyFromPasswordDirectHash(password);
+                    using (AesGcm aesGcm = new AesGcm(decryptionKey))
+                    {
+                        aesGcm.Decrypt(gcmIvFromEnvelope, cipherTextFromEnvelope, gcmTagFromEnvelope, plainBytes, null);
+                    }
+                    decryptedTextResult = Encoding.UTF8.GetString(plainBytes);
+                    debugInfoResult = DebugMode ? $@"解密参数 (基础核心模式 V0 - 确定性):
+- Decryption Key (Base64, SHA512(password) 前32字节): {Convert.ToBase64String(decryptionKey)}
+- Data GCM IV (Base64, Deterministic from Plaintext, read from I field): {envelope.I}
+- Data GCM Tag (Base64): {envelope.T}
+警告: 此模式密钥直接由密码SHA512哈希的前32字节生成。" : string.Empty;
+                }
+                else if (envelope.V == "1") // V1: 双层解密 (Argon2 KDF)
+                {
+                    if (saltFromEnvelope == null) throw new Exception("V1 模式密文缺少 Salt (S 字段)。");
+                    int am = envelope.AM, ai = envelope.AI, ap = envelope.AP;
+                    if (am <= 0 || ai <= 0 || ap <= 0) throw new Exception($"V1 模式 Argon2 参数无效 (M:{am},I:{ai},P:{ap})。");
+
+                    byte[] kek_v1 = DeriveKeyFromPassword(password, saltFromEnvelope, 32, am, ai, ap); // KEK for V1
+                    decryptionKey = kek_v1; // Store kek_v1 for final clearing
+                    byte[] dek = null; // Data Encryption Key
                     try
                     {
-                        string jsonString = Encoding.UTF8.GetString(potentialJsonPayload);
-                        var tempEnvelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
-                        if (tempEnvelope != null && tempEnvelope.V == "1") // Expect V="1" if an external nonce was stripped
+                        if (string.IsNullOrEmpty(envelope.K)) throw new FormatException("V1 密文缺少 K 字段。");
+                        string[] keyParts = envelope.K.Split(':');
+                        if (keyParts.Length != 2) throw new FormatException("K 字段格式错误。");
+                        byte[] encryptedDek = Convert.FromBase64String(keyParts[0]);
+                        byte[] dekIv = Convert.FromBase64String(keyParts[1]);
+
+                        using (Aes aes = Aes.Create())
                         {
-                            envelope = tempEnvelope;
-                            jsonPayloadToParse = potentialJsonPayload; // This was the JSON
-                            isV1StructureWithNonce = true;
+                            aes.KeySize = 256; aes.Mode = CipherMode.CBC; aes.Padding = PaddingMode.PKCS7;
+                            aes.Key = kek_v1; // Use KEK to decrypt DEK
+                            aes.IV = dekIv;
+                            using (ICryptoTransform decryptor = aes.CreateDecryptor())
+                            {
+                                dek = decryptor.TransformFinalBlock(encryptedDek, 0, encryptedDek.Length);
+                            }
                         }
-                    }
-                    catch (Exception) { /* Swallow, envelope remains null if parsing fails */ }
-                }
-            }
 
-            if (envelope == null)
-            {
-                throw new Exception("解码后的数据无法识别为有效的加密格式 (JSON解析失败或版本不匹配)，可能是密码错误或密文损坏。");
-            }
-
-            byte[] salt;
-            try
-            {
-                salt = Convert.FromBase64String(envelope.S ?? throw new ArgumentNullException(nameof(envelope.S), "Salt 字段为空"));
-            }
-            catch (FormatException ex) { throw new Exception("Salt 格式错误，可能密文损坏。", ex); }
-            catch (ArgumentNullException ex) { throw new Exception(ex.Message, ex); }
-
-
-            int argon2MemorySizeKB = envelope.AM;
-            int argon2Iterations = envelope.AI;
-            int argon2Parallelism = envelope.AP;
-
-            if (argon2MemorySizeKB <= 0 || argon2Iterations <= 0 || argon2Parallelism <= 0)
-            {
-                throw new Exception($"从密文加载的 Argon2 参数无效或缺失 (Memory: {argon2MemorySizeKB}KB, Iterations: {argon2Iterations}, Parallelism: {argon2Parallelism})。密文可能已损坏或来自不兼容的版本。");
-            }
-
-            byte[] kek = DeriveKeyFromPassword(password, salt, 32, argon2MemorySizeKB, argon2Iterations, argon2Parallelism);
-
-            byte[] cipherTextBytes;
-            byte[] gcmIv;
-            byte[] gcmTag;
-            try
-            {
-                cipherTextBytes = Convert.FromBase64String(envelope.C ?? throw new ArgumentNullException(nameof(envelope.C), "CipherText 字段为空"));
-                gcmIv = Convert.FromBase64String(envelope.I ?? throw new ArgumentNullException(nameof(envelope.I), "GCM IV 字段为空"));
-                gcmTag = Convert.FromBase64String(envelope.T ?? throw new ArgumentNullException(nameof(envelope.T), "GCM Tag 字段为空"));
-            }
-            catch (FormatException ex) { throw new Exception("密文、IV 或 Tag 格式错误，可能密文损坏。", ex); }
-            catch (ArgumentNullException ex) { throw new Exception(ex.Message, ex); }
-
-
-            byte[] plainBytes = new byte[cipherTextBytes.Length]; // AES-GCM output is same size as input
-            string debugInfo;
-            string decryptedText;
-
-            if (envelope.V == "1") // 双层解密 V1
-            {
-                byte[] encryptedDek;
-                byte[] dekIv;
-                byte[] dek = null; // Initialize to null for finally block
-                string externalNonceB64 = "N/A (Not applicable or not parsed)";
-                if (isV1StructureWithNonce && decodedBytes.Length > RANDOM_NONCE_LENGTH)
-                {
-                    byte[] noncePart = new byte[RANDOM_NONCE_LENGTH];
-                    Buffer.BlockCopy(decodedBytes, 0, noncePart, 0, RANDOM_NONCE_LENGTH);
-                    externalNonceB64 = Convert.ToBase64String(noncePart);
-                }
-
-
-                try
-                {
-                    if (string.IsNullOrEmpty(envelope.K))
-                    {
-                        throw new FormatException("双层加密(V1)密文缺少 K 字段 (加密的DEK和IV)。");
-                    }
-                    string[] keyParts = envelope.K.Split(':');
-                    if (keyParts.Length != 2)
-                        throw new FormatException("加密密钥或 IV 格式错误 (K字段格式不对)。");
-                    encryptedDek = Convert.FromBase64String(keyParts[0]);
-                    dekIv = Convert.FromBase64String(keyParts[1]);
-                }
-                catch (FormatException ex) { throw new Exception("双层加密(V1)的加密密钥(K)或其IV格式错误，可能密文损坏。", ex); }
-
-                try
-                {
-                    using (Aes aes = Aes.Create())
-                    {
-                        aes.KeySize = 256;
-                        aes.Mode = CipherMode.CBC;
-                        aes.Padding = PaddingMode.PKCS7; // Ensure padding matches encryption
-                        aes.Key = kek;
-                        aes.IV = dekIv;
-                        using (ICryptoTransform decryptor = aes.CreateDecryptor())
+                        using (AesGcm aesGcm = new AesGcm(dek)) // Use DEK for data decryption
                         {
-                            dek = decryptor.TransformFinalBlock(encryptedDek, 0, encryptedDek.Length);
+                            aesGcm.Decrypt(gcmIvFromEnvelope, cipherTextFromEnvelope, gcmTagFromEnvelope, plainBytes, null);
                         }
-                    }
-                }
-                catch (CryptographicException ex) { throw new Exception("DEK 解密失败 (V1)，可能密码不正确或密文损坏。", ex); }
-
-                try
-                {
-                    using (AesGcm aesGcm = new AesGcm(dek))
-                    {
-                        aesGcm.Decrypt(gcmIv, cipherTextBytes, gcmTag, plainBytes, null);
-                    }
-                }
-                catch (CryptographicException ex) { throw new Exception("数据解密或认证失败 (V1)，可能密码不正确或密文已被篡改。", ex); }
-                finally
-                {
-                    if (dek != null) Array.Clear(dek, 0, dek.Length); // Clear DEK from memory
-                }
-
-                decryptedText = Encoding.UTF8.GetString(plainBytes);
-                // Updated debug info name
-                debugInfo = DebugMode ? $@"解密参数 (双层加密 V1):
-- DEK (Base64): {(dek != null ? Convert.ToBase64String(dek) : "Error/NotAvailable")} (Intermediate)
-- KEK (Base64): {Convert.ToBase64String(kek)}
+                        decryptedTextResult = Encoding.UTF8.GetString(plainBytes);
+                        debugInfoResult = DebugMode ? $@"解密参数 (双层加密 V1):
+- DEK (Base64): {Convert.ToBase64String(dek)} (Intermediate)
+- KEK (Base64, from Argon2id): {Convert.ToBase64String(kek_v1)}
 - Salt (Base64): {envelope.S}
-- DEK CBC IV (Base64): {Convert.ToBase64String(dekIv)} (From K field)
+- DEK CBC IV (Base64): {Convert.ToBase64String(dekIv)}
 - Data GCM IV (Base64): {envelope.I}
 - Data GCM Tag (Base64): {envelope.T}
-- External Nonce (Base64, V1 structure): {externalNonceB64}
-- Argon2 Memory Size: {argon2MemorySizeKB} KB
-- Argon2 Iterations: {argon2Iterations}
-- Argon2 Parallelism: {argon2Parallelism}
-- Shuffled Charset: {shuffledCharset}
-- Custom Base: {customBase}" : string.Empty;
-            }
-            else if (envelope.V == "2") // 直接解密 V2
-            {
-                try
-                {
-                    using (AesGcm aesGcm = new AesGcm(kek))
+- Argon2 Memory Size: {am} KB, Iterations: {ai}, Parallelism: {ap}" : string.Empty;
+                    }
+                    catch (CryptographicException ex) { throw new Exception($"V1 解密失败，可能密码错误或密文损坏/被篡改: {ex.Message}", ex); }
+                    finally
                     {
-                        aesGcm.Decrypt(gcmIv, cipherTextBytes, gcmTag, plainBytes, null);
+                        if (dek != null) Array.Clear(dek, 0, dek.Length); // Clear DEK from memory
                     }
                 }
-                catch (CryptographicException ex) { throw new Exception("数据解密或认证失败 (V2)，可能密码不正确或密文已被篡改。", ex); }
+                else if (envelope.V == "2") // V2: 直接解密 (Argon2 KDF)
+                {
+                    if (saltFromEnvelope == null) throw new Exception("V2 模式密文缺少 Salt (S 字段)。");
+                    int am = envelope.AM, ai = envelope.AI, ap = envelope.AP;
+                    if (am <= 0 || ai <= 0 || ap <= 0) throw new Exception($"V2 模式 Argon2 参数无效 (M:{am},I:{ai},P:{ap})。");
 
-                decryptedText = Encoding.UTF8.GetString(plainBytes);
-                // Updated debug info name
-                debugInfo = DebugMode ? $@"解密参数 (直接加密 V2):
-- KEK (Base64): {Convert.ToBase64String(kek)}
+                    decryptionKey = DeriveKeyFromPassword(password, saltFromEnvelope, 32, am, ai, ap);
+                    try
+                    {
+                        using (AesGcm aesGcm = new AesGcm(decryptionKey))
+                        {
+                            aesGcm.Decrypt(gcmIvFromEnvelope, cipherTextFromEnvelope, gcmTagFromEnvelope, plainBytes, null);
+                        }
+                    }
+                    catch (CryptographicException ex) { throw new Exception($"V2 数据解密或认证失败，可能密码不正确或密文已被篡改: {ex.Message}", ex); }
+                    decryptedTextResult = Encoding.UTF8.GetString(plainBytes);
+                    debugInfoResult = DebugMode ? $@"解密参数 (直接加密 V2):
+- Decryption Key (Base64, from Argon2id): {Convert.ToBase64String(decryptionKey)}
 - Salt (Base64): {envelope.S}
 - Data GCM IV (Base64): {envelope.I}
 - Data GCM Tag (Base64): {envelope.T}
-- Argon2 Memory Size: {argon2MemorySizeKB} KB
-- Argon2 Iterations: {argon2Iterations}
-- Argon2 Parallelism: {argon2Parallelism}
-- Shuffled Charset: {shuffledCharset}
-- Custom Base: {customBase}" : string.Empty;
+- Argon2 Memory Size: {am} KB, Iterations: {ai}, Parallelism: {ap}" : string.Empty;
+                }
+                else
+                {
+                    throw new Exception($"不支持的密文版本: {envelope.V}");
+                }
+
+                // Append charset info to debug string for all successful decryptions
+                if (DebugMode)
+                {
+                    try
+                    {
+                        // Attempt to detect common encodings (simplified for example)
+                        bool isUtf8 = IsUTF8(plainBytes);
+                        bool isAscii = IsASCII(plainBytes);
+                        if (isUtf8 && !isAscii) // Most likely non-ASCII UTF-8
+                        {
+                            debugInfoResult += "\n检测到明文编码: UTF-8 (包含非ASCII字符)";
+                        }
+                        else if (isAscii) // Pure ASCII
+                        {
+                            debugInfoResult += "\n检测到明文编码: ASCII";
+                        }
+                        else // Could be other, or not text
+                        {
+                            debugInfoResult += "\n检测到明文编码: UTF-8 (可能是ASCII兼容或其他UTF-8)";
+                        }
+                    }
+                    catch (Exception charsetEx)
+                    {
+                        debugInfoResult += $"\n字符集检测失败: {charsetEx.Message}";
+                    }
+                }
+                return (decryptedTextResult, debugInfoResult);
             }
-            else
+            catch (Exception ex)
             {
-                throw new Exception($"不支持的密文版本: {envelope.V}");
+                // Rethrow with more context or log error
+                throw new Exception($"解密失败: {ex.Message}", ex);
             }
-
-            // Clear KEK from memory
-            if (kek != null) Array.Clear(kek, 0, kek.Length);
-            // Clear plaintext bytes if still held
-            if (plainBytes != null) Array.Clear(plainBytes, 0, plainBytes.Length);
-
-            return (decryptedText, debugInfo);
+            finally
+            {
+                if (decryptionKey != null) Array.Clear(decryptionKey, 0, decryptionKey.Length); // Clear the key from memory
+                if (plainBytes != null) Array.Clear(plainBytes, 0, plainBytes.Length); // Clear plaintext from memory
+            }
         }
 
         static void RunCommandMode(string[] args)
