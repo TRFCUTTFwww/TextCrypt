@@ -1,0 +1,46 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFramework>net8.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+
+		<!-- 指定发布平台，如 Windows x64；需要同时发布 x86/x64 时可分别换成 win-x86、win-x64 -->
+		<RuntimeIdentifier>win-x64</RuntimeIdentifier>
+
+		<!-- 开启单文件发布 -->
+		<PublishSingleFile>true</PublishSingleFile>
+
+		<!-- 如果希望最终 exe 自带 .NET 8 运行时，则设为 true，否则设为 false（需要目标机预装 .NET 8） -->
+		<SelfContained>true</SelfContained>
+
+		<!-- 把所有 native 库（如 SQLite.Interop.dll、sni.dll 等）都嵌入到单文件并运行时自动解压 -->
+		<IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+
+		<!-- 可选：对单文件进行压缩，体积更小但启动可能略慢 -->
+		<EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+
+		<!-- 可选：启用托管代码修剪，减小体积；如使用反射需额外配置 -->
+		<EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<COMReference Include="{bee4bfec-6683-3e67-9167-3c0cbc68f40a}">
+			<WrapperTool>tlbimp</WrapperTool>
+			<VersionMinor>4</VersionMinor>
+			<VersionMajor>2</VersionMajor>
+			<Guid>bee4bfec-6683-3e67-9167-3c0cbc68f40a</Guid>
+		</COMReference>
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Konscious.Security.Cryptography.Argon2" Version="1.3.1" />
+		<PackageReference Include="Sodium.Core" Version="1.4.0" />
+		<PackageReference Include="Spectre.Console" Version="0.50.0" />
+		<PackageReference Include="System.Data.SQLite" Version="1.0.119" />
+		<PackageReference Include="Terminal.Gui" Version="1.18.1" />
+	</ItemGroup>
+
+</Project>
+
