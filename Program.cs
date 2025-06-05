@@ -10,6 +10,7 @@ using System.IO;
 using System.Collections.Generic;
 using System.Linq;
 using Konscious.Security.Cryptography;
+using System.Text.Json.Serialization;
 
 namespace TextCrypt
 {
@@ -27,27 +28,28 @@ namespace TextCrypt
         // Envelope for encrypted data
         class EnvelopeData
         {
-            public string V { get; set; } = "2"; // New mode default
-            public string S { get; set; } // Salt
-            public string K { get; set; } // Encrypted DEK + IV (old mode only)
-            public string I { get; set; } // GCM IV
+            public string V { get; set; } = "2"; // Default to "2" (Direct mode)
+            public string S { get; set; } // Salt (for V0.5, V1, V2)
+
+            [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+            public string K { get; set; } // Encrypted DEK + IV (For V="1" Two-Layer mode only)
+
+            public string I { get; set; } // GCM IV (for V1, V2) or ECB IV (for V0.5, V0)
             public string C { get; set; } // Ciphertext
-            public string T { get; set; } // GCM Tag
-            public int AM { get; set; } // Argon2 Memory
-            public int AI { get; set; } // Argon2 Iterations
-            public int AP { get; set; } // Argon2 Parallelism
+            public string T { get; set; } // GCM Tag (for V1, V2)
+            public int AM { get; set; } // Argon2 Memory (for V1, V2)
+            public int AI { get; set; } // Argon2 Iterations (for V1, V2)
+            public int AP { get; set; } // Argon2 Parallelism (for V1, V2)
         }
 
-        // Argon2 configuration
         class Config
         {
             public int MemorySizeKB { get; set; } = 1024 * 256; // 256MB
-            public int Iterations { get; set; } = 10; // 10 iterations
+            public int Iterations { get; set; } = 10;
             public int Parallelism { get; set; } = Environment.ProcessorCount;
         }
 
-        // Constants
-        private const int RANDOM_NONCE_LENGTH = 16; // For old mode
+        private const int RANDOM_NONCE_LENGTH = 16; // For V1 mode
         private const string BaseAlphanumericCharset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
         private static readonly string ConfigPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "textcrypt_config.json");
         private static Config CurrentConfig = LoadOrCreateConfig();
@@ -236,7 +238,6 @@ namespace TextCrypt
                         Console.WriteLine("历史输出已清除。");
                         break;
                     case "5":
-                        // 提示用户确认是否切换调试模式
                         Console.WriteLine("是否要切换调试模式？输入 'y' 确认，输入其他键取消：");
                         string confirm = Console.ReadLine()?.ToLower();
                         if (confirm == "y")
@@ -244,18 +245,18 @@ namespace TextCrypt
                             DebugMode = !DebugMode;
                             if (DebugMode)
                             {
-                                Console.BackgroundColor = ConsoleColor.Red; // 开启调试模式，背景设为红色
-                                Console.Clear(); // 清屏以应用新背景色
+                                Console.BackgroundColor = ConsoleColor.Red;
+                                Console.Clear();
                                 Console.WriteLine("调试模式已开启");
                                 Console.WriteLine("警告：调试模式已开启，将输出主密钥、salt等敏感信息，请确保安全环境！");
                             }
                             else
                             {
-                                Console.BackgroundColor = ConsoleColor.Black; // 关闭调试模式，背景设为黑色
-                                Console.Clear(); // 清屏以应用新背景色
+                                Console.BackgroundColor = ConsoleColor.Black;
+                                Console.Clear();
                                 Console.WriteLine("调试模式已关闭");
                             }
-                            Console.ResetColor(); // 重置前景色以确保文字可读
+                            Console.ResetColor();
                         }
                         else
                         {
@@ -284,165 +285,212 @@ namespace TextCrypt
             Console.Write("请输入选择 (1/2, 默认2): ");
             var inputChoice = Console.ReadLine();
 
-            string plaintext = null;
-
-            if (inputChoice == "1")
+            char[] plaintextChars = null;
+            try
             {
-                Console.WriteLine("\n=== 内置编辑器：编辑多行文本 (按 F2 完成) ===\n");
-                plaintext = ReadMultilineInputAdvanced();
-            }
-            else
-            {
-                string tempFileName = "textcrypt_edit_" + Guid.NewGuid().ToString("N").Substring(0, 12) + ".txt";
-                string tempFilePath = Path.Combine(Path.GetTempPath(), tempFileName);
-
-                try
+                if (inputChoice == "1")
                 {
-                    File.WriteAllText(tempFilePath, "");
-                    bool editingConfirmed = false;
-                    while (!editingConfirmed)
+                    Console.WriteLine("\n=== 内置编辑器：编辑多行文本 (按 F2 完成) ===\n");
+                    string tempText = ReadMultilineInputAdvanced();
+                    plaintextChars = tempText.ToCharArray();
+                }
+                else
+                {
+                    string tempFileName = "textcrypt_edit_" + Guid.NewGuid().ToString("N").Substring(0, 12) + ".txt";
+                    string tempFilePath = Path.Combine(Path.GetTempPath(), tempFileName);
+
+                    try
                     {
-                        Console.WriteLine($"\n正在尝试使用系统默认程序打开临时文件: {tempFilePath}");
-                        Console.WriteLine("请在外部编辑器中编辑内容，【保存并关闭编辑器后】返回此处。");
-
-                        var editorProcess = new Process();
-                        editorProcess.StartInfo.FileName = tempFilePath;
-                        editorProcess.StartInfo.UseShellExecute = true;
-
-                        try
+                        File.WriteAllText(tempFilePath, "");
+                        bool editingConfirmed = false;
+                        while (!editingConfirmed)
                         {
-                            editorProcess.Start();
-                            editorProcess.WaitForExit();
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"\n启动默认编辑器失败: {ex.Message}");
-                            Console.Write("是否取消操作？(y/n): ");
-                            if (Console.ReadLine()?.ToLower() == "y")
+                            Console.WriteLine($"\n正在尝试使用系统默认程序打开临时文件: {tempFilePath}");
+                            Console.WriteLine("请在外部编辑器中编辑内容，【保存并关闭编辑器后】返回此处。");
+
+                            var editorProcess = new Process();
+                            editorProcess.StartInfo.FileName = tempFilePath;
+                            editorProcess.StartInfo.UseShellExecute = true;
+
+                            try
+                            {
+                                editorProcess.Start();
+                                editorProcess.WaitForExit();
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"\n启动默认编辑器失败: {ex.Message}");
+                                Console.Write("是否取消操作？(y/n): ");
+                                if (Console.ReadLine()?.ToLower() == "y")
+                                {
+                                    Console.WriteLine("操作已取消。");
+                                    return;
+                                }
+                                continue;
+                            }
+
+                            Console.Write("\n编辑完成？ (y - 完成并继续 / r - 重新编辑 / c - 取消操作): ");
+                            string confirmation = Console.ReadLine()?.ToLower();
+
+                            if (confirmation == "y")
+                            {
+                                editingConfirmed = true;
+                            }
+                            else if (confirmation == "r")
+                            {
+                                // Loop again to re-open editor
+                            }
+                            else
                             {
                                 Console.WriteLine("操作已取消。");
                                 return;
                             }
-                            continue;
                         }
 
-                        Console.Write("\n编辑完成？ (y - 完成并继续 / r - 重新编辑 / c - 取消操作): ");
-                        string confirmation = Console.ReadLine()?.ToLower();
-
-                        if (confirmation == "y")
+                        plaintextChars = File.ReadAllText(tempFilePath).ToCharArray();
+                        Console.WriteLine($"\n已从临时文件读取文本。");
+                    }
+                    finally
+                    {
+                        if (File.Exists(tempFilePath))
                         {
-                            editingConfirmed = true;
-                        }
-                        else if (confirmation == "r")
-                        {
-                            // Loop again to re-open editor
-                        }
-                        else
-                        {
-                            Console.WriteLine("操作已取消。");
-                            return;
+                            try
+                            {
+                                File.Delete(tempFilePath);
+                            }
+                            catch (IOException ex)
+                            {
+                                Console.WriteLine($"警告: 删除临时文件 {tempFilePath} 失败: {ex.Message}");
+                            }
                         }
                     }
+                }
 
-                    plaintext = File.ReadAllText(tempFilePath);
-                    Console.WriteLine($"\n已从临时文件读取文本。");
+                if (plaintextChars == null || plaintextChars.Length == 0)
+                {
+                    Console.WriteLine("未输入任何文本，操作已取消。");
+                    return;
+                }
+
+                Console.Write("\n请输入密码: ");
+                char[] password = ReadPassword();
+                try
+                {
+                    if (password == null || password.Length == 0)
+                    {
+                        Console.WriteLine("\n密码不能为空，操作已取消。");
+                        return;
+                    }
+
+                    Console.Write("\n请再次输入密码: ");
+                    char[] confirmPassword = ReadPassword();
+                    try
+                    {
+                        if (!password.SequenceEqual(confirmPassword))
+                        {
+                            Console.WriteLine("\n两次输入的密码不一致，操作已取消。");
+                            return;
+                        }
+
+                        Console.WriteLine("\n请选择加密模式:");
+                        Console.WriteLine("1. 双层加密 (主密钥加密数据密钥，数据密钥加密文本 - 旧V1架构)");
+                        Console.WriteLine("2. 直接加密 (主密钥直接加密文本 - 新V2架构，推荐)");
+                        Console.WriteLine("3. 盐值随机模式 (仅用盐值增加随机性，AES-256-ECB加密 - V0.5)");
+                        Console.WriteLine("4. 核心直加密模式 (无盐值，确定性加密，AES-256-ECB - V0)");
+                        Console.Write("请输入选项 (默认为 2): ");
+                        string modeChoiceStr = Console.ReadLine()?.Trim();
+
+                        string mode;
+                        switch (modeChoiceStr)
+                        {
+                            case "1": mode = "V1"; break;
+                            case "3": mode = "V0.5"; break;
+                            case "4": mode = "V0"; break;
+                            default: mode = "V2"; break; // Includes "2" or empty
+                        }
+
+                        string selectedModeName = mode switch
+                        {
+                            "V1" => "双层加密 (旧V1架构)",
+                            "V0.5" => "盐值随机模式 (V0.5)",
+                            "V0" => "核心直加密模式 (V0)",
+                            _ => "直接加密 (新V2架构, 推荐)"
+                        };
+                        Console.WriteLine($"已选择: {selectedModeName}");
+
+                        Console.WriteLine("\n正在加密，这可能需要一些时间，请稍候...");
+                        byte[] plaintextBytes = Encoding.UTF8.GetBytes(plaintextChars);
+                        try
+                        {
+                            var (encrypted, debugInfo) = EncryptText(plaintextBytes, password, mode);
+                            Console.WriteLine("\n√ 加密完成");
+
+                            if (DebugMode)
+                            {
+                                Console.WriteLine("\n调试信息 (加密参数):");
+                                Console.WriteLine(debugInfo);
+                            }
+
+                            Console.WriteLine("\n加密结果输出方式:");
+                            Console.WriteLine("1. 直接显示");
+                            Console.WriteLine("2. 保存到文件");
+                            Console.WriteLine("3. 保存到数据库");
+                            Console.Write("请选择 (1-3): ");
+
+                            var outputChoice = Console.ReadLine();
+
+                            switch (outputChoice)
+                            {
+                                case "2":
+                                    Console.Write("请输入文件路径: ");
+                                    var filePath = Console.ReadLine();
+                                    try
+                                    {
+                                        File.WriteAllText(filePath, encrypted);
+                                        Console.WriteLine($"加密结果已保存到: {filePath}");
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Console.WriteLine($"保存文件失败: {ex.Message}");
+                                    }
+                                    break;
+
+                                case "3":
+                                    SaveToDatabase(encrypted);
+                                    break;
+
+                                default:
+                                    Console.WriteLine($"\n加密结果:\n{encrypted}");
+                                    Console.WriteLine("\n按下回车返回主菜单");
+                                    Console.ReadLine();
+                                    break;
+                            }
+                        }
+                        finally
+                        {
+                            Array.Clear(plaintextBytes, 0, plaintextBytes.Length);
+                        }
+                    }
+                    finally
+                    {
+                        Array.Clear(confirmPassword, 0, confirmPassword.Length);
+                    }
                 }
                 finally
                 {
-                    if (File.Exists(tempFilePath))
-                    {
-                        try
-                        {
-                            File.Delete(tempFilePath);
-                        }
-                        catch (IOException ex)
-                        {
-                            Console.WriteLine($"警告: 删除临时文件 {tempFilePath} 失败: {ex.Message}");
-                        }
-                    }
+                    Array.Clear(password, 0, password.Length);
                 }
             }
-
-            if (string.IsNullOrWhiteSpace(plaintext))
+            finally
             {
-                Console.WriteLine("未输入任何文本，操作已取消。");
-                return;
-            }
-
-            Console.Write("\n请输入密码: ");
-            var password = ReadPassword();
-
-            if (string.IsNullOrEmpty(password))
-            {
-                Console.WriteLine("\n密码不能为空，操作已取消。");
-                return;
-            }
-
-            Console.Write("\n请再次输入密码: ");
-            var confirmPassword = ReadPassword();
-
-            if (password != confirmPassword)
-            {
-                Console.WriteLine("\n两次输入的密码不一致，操作已取消。");
-                return;
-            }
-
-            Console.WriteLine("\n请选择加密模式:");
-            Console.WriteLine("1. 新模式 (默认，推荐) - 更安全，使用 AES-GCM，无填充攻击风险，密文较短");
-            Console.WriteLine("2. 旧模式 - 兼容旧密文，使用 AES-CBC 和 AES-GCM，存在填充攻击风险，密文较长");
-            Console.Write("请输入选择 (1/2, 默认1): ");
-            var modeChoice = Console.ReadLine();
-            bool useOldMode = modeChoice == "2";
-
-            Console.WriteLine("\n正在加密，这可能需要一些时间，请稍候...");
-            var (encrypted, debugInfo) = EncryptText(plaintext, password, useOldMode);
-            Console.WriteLine("\n√ 加密完成");
-
-            if (DebugMode)
-            {
-                Console.WriteLine("\n调试信息 (加密参数):");
-                Console.WriteLine(debugInfo);
-            }
-
-            Console.WriteLine("\n加密结果输出方式:");
-            Console.WriteLine("1. 直接显示");
-            Console.WriteLine("2. 保存到文件");
-            Console.WriteLine("3. 保存到数据库");
-            Console.Write("请选择 (1-3): ");
-
-            var outputChoice = Console.ReadLine();
-
-            switch (outputChoice)
-            {
-                case "2":
-                    Console.Write("请输入文件路径: ");
-                    var filePath = Console.ReadLine();
-                    try
-                    {
-                        File.WriteAllText(filePath, encrypted);
-                        Console.WriteLine($"加密结果已保存到: {filePath}");
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"保存文件失败: {ex.Message}");
-                    }
-                    break;
-
-                case "3":
-                    SaveToDatabase(encrypted);
-                    break;
-
-                default:
-                    Console.WriteLine($"\n加密结果:\n{encrypted}");
-                    Console.WriteLine("\n按下回车返回主菜单");
-                    Console.ReadLine(); // 等待用户按下回车
-                    break;
+                if (plaintextChars != null)
+                    Array.Clear(plaintextChars, 0, plaintextChars.Length);
             }
         }
 
-        static string ReadPassword()
+        static char[] ReadPassword()
         {
-            var password = new StringBuilder();
+            List<char> passwordList = new List<char>();
             ConsoleKeyInfo key;
 
             do
@@ -450,139 +498,275 @@ namespace TextCrypt
                 key = Console.ReadKey(true);
                 if (key.Key == ConsoleKey.Backspace)
                 {
-                    if (password.Length > 0)
+                    if (passwordList.Count > 0)
                     {
-                        password.Remove(password.Length - 1, 1);
+                        passwordList.RemoveAt(passwordList.Count - 1);
                     }
                 }
                 else if (key.Key != ConsoleKey.Enter)
                 {
-                    password.Append(key.KeyChar);
+                    passwordList.Add(key.KeyChar);
                 }
             } while (key.Key != ConsoleKey.Enter);
             Console.WriteLine();
-            return password.ToString();
+
+            char[] password = passwordList.ToArray();
+            return password;
         }
 
-        static (string encryptedText, string debugInfo) EncryptText(string plainText, string password, bool useOldMode)
+        static (string encryptedText, string debugInfo) EncryptText(byte[] plaintextBytes, char[] password, string mode)
         {
-            int argon2MemorySizeKB = CurrentConfig.MemorySizeKB;
-            int argon2Iterations = CurrentConfig.Iterations;
-            int argon2Parallelism = CurrentConfig.Parallelism;
+            string encryptedText = null;
+            string debugInfo = string.Empty;
+            byte[] kek = null;
+            byte[] salt = null;
+            byte[] cipherTextBytes = null;
+            byte[] iv = null;
+            EnvelopeData envelope = null;
 
-            byte[] salt = GenerateRandomBytes(16);
-            byte[] kek = DeriveKeyFromPassword(password, salt, 32, argon2MemorySizeKB, argon2Iterations, argon2Parallelism);
-            byte[] cipherTextBytes;
-            byte[] gcmTag = new byte[16];
-            byte[] gcmIv = GenerateRandomBytes(12);
-            EnvelopeData envelope;
-            string debugInfo;
-
-            if (useOldMode)
+            try
             {
-                // Old mode: AES-CBC for DEK, AES-GCM for data, with nonce
-                byte[] dek = GenerateRandomBytes(32);
-                byte[] encryptedDek;
-                byte[] dekIv = GenerateRandomBytes(16);
-                using (Aes aes = Aes.Create())
+                string passwordStr = new string(password);
+                var (shuffledCharset, _, customBase) = GeneratePasswordDerivedCharset(passwordStr);
+
+                if (mode == "V1")
                 {
-                    aes.KeySize = 256;
-                    aes.Mode = CipherMode.CBC;
-                    aes.Padding = PaddingMode.PKCS7;
-                    aes.Key = kek;
-                    aes.IV = dekIv;
-                    using (ICryptoTransform encryptor = aes.CreateEncryptor())
+                    int argon2MemorySizeKB = CurrentConfig.MemorySizeKB;
+                    int argon2Iterations = CurrentConfig.Iterations;
+                    int argon2Parallelism = CurrentConfig.Parallelism;
+
+                    salt = GenerateRandomBytes(16);
+                    kek = DeriveKeyFromPassword(password, salt, 32, argon2MemorySizeKB, argon2Iterations, argon2Parallelism);
+                    byte[] dek = GenerateRandomBytes(32);
+                    byte[] encryptedDek = null;
+                    byte[] dekIv = GenerateRandomBytes(16);
+                    byte[] gcmTag = new byte[16];
+                    byte[] gcmIv = GenerateRandomBytes(12);
+
+                    try
                     {
-                        encryptedDek = encryptor.TransformFinalBlock(dek, 0, dek.Length);
+                        using (Aes aes = Aes.Create())
+                        {
+                            aes.KeySize = 256;
+                            aes.Mode = CipherMode.CBC;
+                            aes.Padding = PaddingMode.PKCS7;
+                            aes.Key = kek;
+                            aes.IV = dekIv;
+                            using (ICryptoTransform encryptor = aes.CreateEncryptor())
+                            {
+                                encryptedDek = encryptor.TransformFinalBlock(dek, 0, dek.Length);
+                            }
+                        }
+
+                        cipherTextBytes = new byte[plaintextBytes.Length];
+                        using (AesGcm aesGcm = new AesGcm(dek))
+                        {
+                            aesGcm.Encrypt(gcmIv, plaintextBytes, cipherTextBytes, gcmTag, null);
+                        }
+
+                        envelope = new EnvelopeData
+                        {
+                            V = "1",
+                            S = Convert.ToBase64String(salt),
+                            K = Convert.ToBase64String(encryptedDek) + ":" + Convert.ToBase64String(dekIv),
+                            I = Convert.ToBase64String(gcmIv),
+                            C = Convert.ToBase64String(cipherTextBytes),
+                            T = Convert.ToBase64String(gcmTag),
+                            AM = argon2MemorySizeKB,
+                            AI = argon2Iterations,
+                            AP = argon2Parallelism
+                        };
+
+                        string json = JsonSerializer.Serialize(envelope, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+                        byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
+                        byte[] nonceForV1 = GenerateRandomBytes(RANDOM_NONCE_LENGTH);
+                        byte[] finalBytesToEncode = new byte[nonceForV1.Length + jsonBytes.Length];
+                        Buffer.BlockCopy(nonceForV1, 0, finalBytesToEncode, 0, nonceForV1.Length);
+                        Buffer.BlockCopy(jsonBytes, 0, finalBytesToEncode, nonceForV1.Length, jsonBytes.Length);
+
+                        encryptedText = BytesToPasswordDerivedBaseString(finalBytesToEncode, shuffledCharset, customBase);
+
+                        debugInfo = DebugMode ? $@"加密参数 (双层加密 V1):
+- DEK (Base64): {Convert.ToBase64String(dek)} (Intermediate, not stored directly)
+- KEK (Base64): {Convert.ToBase64String(kek)}
+- Salt (Base64): {envelope.S}
+- DEK CBC IV (Base64): {Convert.ToBase64String(dekIv)}
+- Data GCM IV (Base64): {envelope.I}
+- Data GCM Tag (Base64): {envelope.T}
+- External Nonce (Base64, for V1 structure): {Convert.ToBase64String(nonceForV1)}
+- Argon2 Memory Size: {argon2MemorySizeKB} KB
+- Argon2 Iterations: {argon2Iterations}
+- Argon2 Parallelism: {argon2Parallelism}
+- Shuffled Charset: {shuffledCharset}
+- Custom Base: {customBase}" : string.Empty;
+
+                        Array.Clear(dek, 0, dek.Length);
+                    }
+                    finally
+                    {
+                        if (encryptedDek != null) Array.Clear(encryptedDek, 0, encryptedDek.Length);
+                        if (dekIv != null) Array.Clear(dekIv, 0, dekIv.Length);
+                        if (gcmTag != null) Array.Clear(gcmTag, 0, gcmTag.Length);
+                        if (gcmIv != null) Array.Clear(gcmIv, 0, gcmIv.Length);
                     }
                 }
-
-                using (AesGcm aesGcm = new AesGcm(dek))
+                else if (mode == "V2")
                 {
-                    byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
-                    cipherTextBytes = new byte[plainBytes.Length];
-                    aesGcm.Encrypt(gcmIv, plainBytes, cipherTextBytes, gcmTag, null);
-                }
+                    int argon2MemorySizeKB = CurrentConfig.MemorySizeKB;
+                    int argon2Iterations = CurrentConfig.Iterations;
+                    int argon2Parallelism = CurrentConfig.Parallelism;
 
-                envelope = new EnvelopeData
-                {
-                    V = "1",
-                    S = Convert.ToBase64String(salt),
-                    K = Convert.ToBase64String(encryptedDek) + ":" + Convert.ToBase64String(dekIv),
-                    I = Convert.ToBase64String(gcmIv),
-                    C = Convert.ToBase64String(cipherTextBytes),
-                    T = Convert.ToBase64String(gcmTag),
-                    AM = argon2MemorySizeKB,
-                    AI = argon2Iterations,
-                    AP = argon2Parallelism
-                };
+                    salt = GenerateRandomBytes(16);
+                    kek = DeriveKeyFromPassword(password, salt, 32, argon2MemorySizeKB, argon2Iterations, argon2Parallelism);
+                    byte[] gcmTag = new byte[16];
+                    byte[] gcmIv = GenerateRandomBytes(12);
+                    cipherTextBytes = new byte[plaintextBytes.Length];
 
-                string json = JsonSerializer.Serialize(envelope);
-                byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
-                byte[] nonce = GenerateRandomBytes(RANDOM_NONCE_LENGTH);
-                byte[] finalBytesToEncode = new byte[nonce.Length + jsonBytes.Length];
-                Buffer.BlockCopy(nonce, 0, finalBytesToEncode, 0, nonce.Length);
-                Buffer.BlockCopy(jsonBytes, 0, finalBytesToEncode, nonce.Length, jsonBytes.Length);
+                    try
+                    {
+                        using (AesGcm aesGcm = new AesGcm(kek))
+                        {
+                            aesGcm.Encrypt(gcmIv, plaintextBytes, cipherTextBytes, gcmTag, null);
+                        }
 
-                var (shuffledCharset, _, customBase) = GeneratePasswordDerivedCharset(password);
-                string encryptedText = BytesToPasswordDerivedBaseString(finalBytesToEncode, shuffledCharset, customBase);
+                        envelope = new EnvelopeData
+                        {
+                            V = "2",
+                            S = Convert.ToBase64String(salt),
+                            I = Convert.ToBase64String(gcmIv),
+                            C = Convert.ToBase64String(cipherTextBytes),
+                            T = Convert.ToBase64String(gcmTag),
+                            AM = argon2MemorySizeKB,
+                            AI = argon2Iterations,
+                            AP = argon2Parallelism
+                        };
 
-                debugInfo = DebugMode ? $@"加密参数 (旧模式):
-- DEK (Base64): {Convert.ToBase64String(dek)}
+                        string json = JsonSerializer.Serialize(envelope, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+                        byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
+                        encryptedText = BytesToPasswordDerivedBaseString(jsonBytes, shuffledCharset, customBase);
+
+                        debugInfo = DebugMode ? $@"加密参数 (直接加密 V2):
 - KEK (Base64): {Convert.ToBase64String(kek)}
 - Salt (Base64): {envelope.S}
-- DEK IV (Base64): {Convert.ToBase64String(dekIv)}
-- GCM IV (Base64): {envelope.I}
-- GCM Tag (Base64): {envelope.T}
+- Data GCM IV (Base64): {envelope.I}
+- Data GCM Tag (Base64): {envelope.T}
 - Argon2 Memory Size: {argon2MemorySizeKB} KB
 - Argon2 Iterations: {argon2Iterations}
 - Argon2 Parallelism: {argon2Parallelism}
 - Shuffled Charset: {shuffledCharset}
 - Custom Base: {customBase}" : string.Empty;
 
-                return (encryptedText, debugInfo);
+                        Array.Clear(gcmTag, 0, gcmTag.Length);
+                        Array.Clear(gcmIv, 0, gcmIv.Length);
+                    }
+                    finally
+                    {
+                        if (gcmTag != null) Array.Clear(gcmTag, 0, gcmTag.Length);
+                        if (gcmIv != null) Array.Clear(gcmIv, 0, gcmIv.Length);
+                    }
+                }
+                else if (mode == "V0.5")
+                {
+                    salt = GenerateRandomBytes(16);
+                    kek = DeriveKeySHA512(passwordStr, 32);
+                    iv = GenerateRandomBytes(16);
+                    cipherTextBytes = new byte[plaintextBytes.Length];
+
+                    try
+                    {
+                        using (Aes aes = Aes.Create())
+                        {
+                            aes.KeySize = 256;
+                            aes.Mode = CipherMode.ECB;
+                            aes.Padding = PaddingMode.PKCS7;
+                            aes.Key = kek;
+                            using (ICryptoTransform encryptor = aes.CreateEncryptor())
+                            {
+                                cipherTextBytes = encryptor.TransformFinalBlock(plaintextBytes, 0, plaintextBytes.Length);
+                            }
+                        }
+
+                        envelope = new EnvelopeData
+                        {
+                            V = "0.5",
+                            S = Convert.ToBase64String(salt),
+                            C = Convert.ToBase64String(cipherTextBytes),
+                            I = Convert.ToBase64String(iv) // Included for compatibility, not used in ECB
+                        };
+
+                        string json = JsonSerializer.Serialize(envelope, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+                        byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
+                        encryptedText = BytesToPasswordDerivedBaseString(jsonBytes, shuffledCharset, customBase);
+
+                        debugInfo = DebugMode ? $@"加密参数 (盐值随机模式 V0.5):
+- KEK (Base64): {Convert.ToBase64String(kek)}
+- Salt (Base64): {envelope.S}
+- ECB IV (Base64, not used in ECB): {envelope.I}
+- Ciphertext (Base64): {envelope.C}
+- Shuffled Charset: {shuffledCharset}
+- Custom Base: {customBase}" : string.Empty;
+
+                        Array.Clear(iv, 0, iv.Length);
+                    }
+                    finally
+                    {
+                        if (iv != null) Array.Clear(iv, 0, iv.Length);
+                    }
+                }
+                else if (mode == "V0")
+                {
+                    kek = DeriveKeySHA512(passwordStr, 32);
+                    iv = GenerateRandomBytes(16); // For compatibility
+                    cipherTextBytes = new byte[plaintextBytes.Length];
+
+                    try
+                    {
+                        using (Aes aes = Aes.Create())
+                        {
+                            aes.KeySize = 256;
+                            aes.Mode = CipherMode.ECB;
+                            aes.Padding = PaddingMode.PKCS7;
+                            aes.Key = kek;
+                            using (ICryptoTransform encryptor = aes.CreateEncryptor())
+                            {
+                                cipherTextBytes = encryptor.TransformFinalBlock(plaintextBytes, 0, plaintextBytes.Length);
+                            }
+                        }
+
+                        envelope = new EnvelopeData
+                        {
+                            V = "0",
+                            C = Convert.ToBase64String(cipherTextBytes),
+                            I = Convert.ToBase64String(iv) // Included for compatibility, not used in ECB
+                        };
+
+                        string json = JsonSerializer.Serialize(envelope, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+                        byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
+                        encryptedText = BytesToPasswordDerivedBaseString(jsonBytes, shuffledCharset, customBase);
+
+                        debugInfo = DebugMode ? $@"加密参数 (核心直加密模式 V0):
+- KEK (Base64): {Convert.ToBase64String(kek)}
+- ECB IV (Base64, not used in ECB): {envelope.I}
+- Ciphertext (Base64): {envelope.C}
+- Shuffled Charset: {shuffledCharset}
+- Custom Base: {customBase}" : string.Empty;
+
+                        Array.Clear(iv, 0, iv.Length);
+                    }
+                    finally
+                    {
+                        if (iv != null) Array.Clear(iv, 0, iv.Length);
+                    }
+                }
             }
-            else
+            finally
             {
-                // New mode: AES-GCM with KEK
-                using (AesGcm aesGcm = new AesGcm(kek))
-                {
-                    byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
-                    cipherTextBytes = new byte[plainBytes.Length];
-                    aesGcm.Encrypt(gcmIv, plainBytes, cipherTextBytes, gcmTag, null);
-                }
-
-                envelope = new EnvelopeData
-                {
-                    V = "2",
-                    S = Convert.ToBase64String(salt),
-                    I = Convert.ToBase64String(gcmIv),
-                    C = Convert.ToBase64String(cipherTextBytes),
-                    T = Convert.ToBase64String(gcmTag),
-                    AM = argon2MemorySizeKB,
-                    AI = argon2Iterations,
-                    AP = argon2Parallelism
-                };
-
-                string json = JsonSerializer.Serialize(envelope);
-                byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
-
-                var (shuffledCharset, _, customBase) = GeneratePasswordDerivedCharset(password);
-                string encryptedText = BytesToPasswordDerivedBaseString(jsonBytes, shuffledCharset, customBase);
-
-                debugInfo = DebugMode ? $@"加密参数 (新模式):
-- KEK (Base64): {Convert.ToBase64String(kek)}
-- Salt (Base64): {envelope.S}
-- GCM IV (Base64): {envelope.I}
-- GCM Tag (Base64): {envelope.T}
-- Argon2 Memory Size: {argon2MemorySizeKB} KB
-- Argon2 Iterations: {argon2Iterations}
-- Argon2 Parallelism: {argon2Parallelism}
-- Shuffled Charset: {shuffledCharset}
-- Custom Base: {customBase}" : string.Empty;
-
-                return (encryptedText, debugInfo);
+                if (kek != null) Array.Clear(kek, 0, kek.Length);
+                if (salt != null) Array.Clear(salt, 0, salt.Length);
+                if (cipherTextBytes != null) Array.Clear(cipherTextBytes, 0, cipherTextBytes.Length);
             }
+
+            return (encryptedText, debugInfo);
         }
 
         static byte[] GenerateRandomBytes(int length)
@@ -595,16 +779,43 @@ namespace TextCrypt
             return bytes;
         }
 
-        static byte[] DeriveKeyFromPassword(string password, byte[] salt, int keySize, int memorySizeKB, int iterations, int parallelism)
+        static byte[] DeriveKeyFromPassword(char[] password, byte[] salt, int keySize, int memorySizeKB, int iterations, int parallelism)
         {
-            var argon2 = new Argon2id(Encoding.UTF8.GetBytes(password))
+            byte[] passwordBytes = Encoding.UTF8.GetBytes(password);
+            try
             {
-                Salt = salt,
-                DegreeOfParallelism = parallelism,
-                Iterations = iterations,
-                MemorySize = memorySizeKB
-            };
-            return argon2.GetBytes(keySize);
+                var argon2 = new Argon2id(passwordBytes)
+                {
+                    Salt = salt,
+                    DegreeOfParallelism = parallelism,
+                    Iterations = iterations,
+                    MemorySize = memorySizeKB
+                };
+                return argon2.GetBytes(keySize);
+            }
+            finally
+            {
+                Array.Clear(passwordBytes, 0, passwordBytes.Length);
+            }
+        }
+
+        static byte[] DeriveKeySHA512(string password, int keySize)
+        {
+            byte[] passwordBytes = Encoding.UTF8.GetBytes(password);
+            try
+            {
+                using (var sha512 = SHA512.Create())
+                {
+                    byte[] hash = sha512.ComputeHash(passwordBytes);
+                    byte[] key = new byte[keySize];
+                    Buffer.BlockCopy(hash, 0, key, 0, keySize);
+                    return key;
+                }
+            }
+            finally
+            {
+                Array.Clear(passwordBytes, 0, passwordBytes.Length);
+            }
         }
 
         static void SaveToDatabase(string cipherText)
@@ -694,7 +905,14 @@ namespace TextCrypt
                     {
                         Console.Write("请输入校验短语: ");
                         var checkPhrase = ReadPassword();
-                        checkSum = GenerateHMAC_SHA512(cipherText, checkPhrase);
+                        try
+                        {
+                            checkSum = GenerateHMAC_SHA512(cipherText, new string(checkPhrase));
+                        }
+                        finally
+                        {
+                            Array.Clear(checkPhrase, 0, checkPhrase.Length);
+                        }
                         Console.WriteLine("\n校验串已生成");
                     }
 
@@ -766,9 +984,9 @@ namespace TextCrypt
                 {
                     if (foundDbFiles != null && choice > 0 && choice <= foundDbFiles.Length)
                     {
-                        return foundDbFiles[choice - 1]; // Selected a listed file
+                        return foundDbFiles[choice - 1];
                     }
-                    else if (choice == optionNumber) // Manual input selected
+                    else if (choice == optionNumber)
                     {
                         Console.Write("\n请输入数据库文件名或完整路径 (例如: mydata.db 或 C:\\path\\to\\mydata.db): ");
                         var dbPath = Console.ReadLine();
@@ -780,7 +998,7 @@ namespace TextCrypt
                         }
                         return dbPath;
                     }
-                    else if (choice == optionNumber + 1) // Back to main menu
+                    else if (choice == optionNumber + 1)
                     {
                         return null;
                     }
@@ -797,12 +1015,13 @@ namespace TextCrypt
                 }
             }
         }
+
         static void OpenEncryptedDatabase()
         {
-            while (true) // Outer loop for choosing a database file or returning to main menu
+            while (true)
             {
                 string dbFile = ChooseDatabaseFile();
-                if (string.IsNullOrEmpty(dbFile)) // User chose to go back to main menu from ChooseDatabaseFile
+                if (string.IsNullOrEmpty(dbFile))
                 {
                     return;
                 }
@@ -812,14 +1031,13 @@ namespace TextCrypt
                     Console.WriteLine($"数据库文件 '{Path.GetFileName(dbFile)}' 不存在。");
                     Console.WriteLine("按任意键返回数据库文件选择...");
                     Console.ReadKey(true);
-                    // Console.Clear(); // Cleared at the start of ChooseDatabaseFile
-                    continue; // Restart outer loop: re-run ChooseDatabaseFile()
+                    continue;
                 }
 
                 var connectionString = $"Data Source={dbFile};Version=3;";
                 List<EncryptedEntry> entries;
 
-                try // Try to load entries for the selected database
+                try
                 {
                     using (var connection = new SQLiteConnection(connectionString))
                     {
@@ -847,19 +1065,16 @@ namespace TextCrypt
                     Console.WriteLine($"\n数据库 '{Path.GetFileName(dbFile)}' 操作失败: {ex.Message}");
                     Console.WriteLine("按任意键返回数据库文件选择...");
                     Console.ReadKey(true);
-                    // Console.Clear(); // Cleared at the start of ChooseDatabaseFile
-                    continue; // Restart outer loop (ChooseDatabaseFile)
+                    continue;
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"\n打开或读取数据库 '{Path.GetFileName(dbFile)}' 时发生错误: {ex.Message}");
                     Console.WriteLine("按任意键返回数据库文件选择...");
                     Console.ReadKey(true);
-                    // Console.Clear(); // Cleared at the start of ChooseDatabaseFile
-                    continue; // Restart outer loop
+                    continue;
                 }
 
-                // Inner loop: Interacting with the chosen and successfully loaded database
                 while (true)
                 {
                     Console.Clear();
@@ -871,8 +1086,8 @@ namespace TextCrypt
                         Console.WriteLine("\n选项:");
                         Console.WriteLine("1. 返回 (选择其他数据库文件)");
                         Console.Write("请选择: ");
-                        Console.ReadLine(); // Consume any input, effectively "press any key"
-                        break; // Break inner loop, will continue outer loop (ChooseDatabaseFile again)
+                        Console.ReadLine();
+                        break;
                     }
 
                     Console.WriteLine("\n数据库中的加密文本:");
@@ -908,33 +1123,37 @@ namespace TextCrypt
                                 {
                                     Console.Write("请输入校验短语: ");
                                     var checkPhrase = ReadPassword();
-                                    var computedCheckSum = GenerateHMAC_SHA512(entryToDecrypt.CipherText, checkPhrase);
-
-                                    if (computedCheckSum != entryToDecrypt.CheckSum)
+                                    try
                                     {
-                                        Console.WriteLine("\n警告：校验失败！密文可能已被篡改或校验短语不正确。");
-                                        Console.Write("是否继续尝试解密？(y/n, 默认n): ");
-                                        if (Console.ReadLine()?.ToLower() != "y")
+                                        var computedCheckSum = GenerateHMAC_SHA512(entryToDecrypt.CipherText, new string(checkPhrase));
+                                        if (computedCheckSum != entryToDecrypt.CheckSum)
                                         {
-                                            Console.WriteLine("解密已取消。按任意键返回条目列表...");
-                                            Console.ReadKey(true);
-                                            continue;
+                                            Console.WriteLine("\n警告：校验失败！密文可能已被篡改或校验短语不正确。");
+                                            Console.Write("是否继续尝试解密？(y/n, 默认n): ");
+                                            if (Console.ReadLine()?.ToLower() != "y")
+                                            {
+                                                Console.WriteLine("解密已取消。按任意键返回条目列表...");
+                                                Console.ReadKey(true);
+                                                continue;
+                                            }
+                                        }
+                                        else
+                                        {
+                                            Console.WriteLine("\n校验通过，密文完整性已验证。");
                                         }
                                     }
-                                    else
+                                    finally
                                     {
-                                        Console.WriteLine("\n校验通过，密文完整性已验证。");
+                                        Array.Clear(checkPhrase, 0, checkPhrase.Length);
                                     }
                                 }
                             }
 
                             DecryptWithPassword(entryToDecrypt.CipherText);
-                            //Console.WriteLine("\n解密操作完成。按任意键返回条目列表...");
-                            //Console.ReadKey(true);
                         }
                         else if (choice == entries.Count + 1)
                         {
-                            break; // Break inner loop, will continue outer loop (ChooseDatabaseFile again)
+                            break;
                         }
                         else
                         {
@@ -947,11 +1166,9 @@ namespace TextCrypt
                         Console.WriteLine("无效输入。按任意键重试...");
                         Console.ReadKey(true);
                     }
-                } // End of inner loop (interacting with specific DB)
-                // Console.Clear(); // Cleared at the start of ChooseDatabaseFile
-            } // End of outer loop (choosing DB file or returning to main menu)
+                }
+            }
         }
-
 
         static void DecryptInteractive()
         {
@@ -996,297 +1213,400 @@ namespace TextCrypt
         static void DecryptWithPassword(string encryptedText)
         {
             Console.Write("\n请输入密码: ");
-            var password = ReadPassword();
-
+            char[] password = ReadPassword();
             try
             {
+                if (password == null || password.Length == 0)
+                {
+                    Console.WriteLine("\n密码不能为空，操作已取消。");
+                    return;
+                }
+
                 Console.WriteLine("\n正在解密，这可能需要一些时间，请稍候...");
-                var (decrypted, debugInfo) = DecryptText(encryptedText, password);
-                Console.WriteLine("\n√ 解密成功");
-
-                if (DebugMode)
+                byte[] decryptedBytes;
+                string debugInfo;
+                try
                 {
-                    Console.WriteLine("\n调试信息 (解密参数):");
-                    Console.WriteLine(debugInfo);
+                    (decryptedBytes, debugInfo) = DecryptText(encryptedText, password);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"\n解密失败: {ex.Message}");
+                    return;
                 }
 
-                Console.WriteLine("\n解密结果输出方式:");
-                Console.WriteLine("1. 直接显示");
-                Console.WriteLine("2. 保存到文件");
-                Console.WriteLine("3. 同时显示并保存到文件");
-                Console.Write("请选择 (1-3): ");
-
-                var outputChoice = Console.ReadLine();
-
-                string outputFilePath = null;
-                if (outputChoice == "2" || outputChoice == "3")
+                char[] decryptedChars = Encoding.UTF8.GetChars(decryptedBytes);
+                try
                 {
-                    Console.Write("请输入保存文件的路径: ");
-                    outputFilePath = Console.ReadLine();
+                    Console.WriteLine("\n√ 解密成功");
+
+                    if (DebugMode)
+                    {
+                        Console.WriteLine("\n调试信息 (解密参数):");
+                        Console.WriteLine(debugInfo);
+                    }
+
+                    Console.WriteLine("\n解密结果输出方式:");
+                    Console.WriteLine("1. 直接显示");
+                    Console.WriteLine("2. 保存到文件");
+                    Console.WriteLine("3. 同时显示并保存到文件");
+                    Console.Write("请选择 (1-3): ");
+
+                    var outputChoice = Console.ReadLine();
+
+                    string outputFilePath = null;
+                    if (outputChoice == "2" || outputChoice == "3")
+                    {
+                        Console.Write("请输入保存文件的路径: ");
+                        outputFilePath = Console.ReadLine();
+                    }
+
+                    switch (outputChoice)
+                    {
+                        case "1":
+                            Console.WriteLine($"\n解密结果:\n{new string(decryptedChars)}");
+                            Console.WriteLine("\n按下回车返回主菜单");
+                            Console.ReadLine();
+                            break;
+                        case "2":
+                            if (!string.IsNullOrEmpty(outputFilePath))
+                            {
+                                try
+                                {
+                                    File.WriteAllText(outputFilePath, new string(decryptedChars));
+                                    Console.WriteLine($"\n解密结果已保存到: {outputFilePath}");
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine($"保存文件失败: {ex.Message}");
+                                }
+                            }
+                            else
+                            {
+                                Console.WriteLine("未提供文件路径，操作取消。");
+                            }
+                            break;
+                        case "3":
+                            Console.WriteLine($"\n解密结果:\n{new string(decryptedChars)}");
+                            if (!string.IsNullOrEmpty(outputFilePath))
+                            {
+                                try
+                                {
+                                    File.WriteAllText(outputFilePath, new string(decryptedChars));
+                                    Console.WriteLine($"\n解密结果已保存到: {outputFilePath}");
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine($"保存文件失败: {ex.Message}");
+                                }
+                            }
+                            else
+                            {
+                                Console.WriteLine("未提供文件路径，仅显示结果。");
+                            }
+                            break;
+                        default:
+                            Console.WriteLine($"\n无效的选择，将直接显示结果:\n{new string(decryptedChars)}");
+                            break;
+                    }
                 }
-
-                switch (outputChoice)
+                finally
                 {
-                    case "1":
-                        Console.WriteLine($"\n解密结果:\n{decrypted}");
-                        Console.WriteLine("\n按下回车返回主菜单");
-                        Console.ReadLine(); // 等待用户按下回车
-                        break;
-                    case "2":
-                        if (!string.IsNullOrEmpty(outputFilePath))
-                        {
-                            try
-                            {
-                                File.WriteAllText(outputFilePath, decrypted);
-                                Console.WriteLine($"\n解密结果已保存到: {outputFilePath}");
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"保存文件失败: {ex.Message}");
-                            }
-                        }
-                        else
-                        {
-                            Console.WriteLine("未提供文件路径，操作取消。");
-                        }
-                        break;
-                    case "3":
-                        Console.WriteLine($"\n解密结果:\n{decrypted}");
-                        if (!string.IsNullOrEmpty(outputFilePath))
-                        {
-                            try
-                            {
-                                File.WriteAllText(outputFilePath, decrypted);
-                                Console.WriteLine($"\n解密结果已保存到: {outputFilePath}");
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"保存文件失败: {ex.Message}");
-                            }
-                        }
-                        else
-                        {
-                            Console.WriteLine("未提供文件路径，仅显示结果。");
-                        }
-                        break;
-                    default:
-                        Console.WriteLine($"\n无效的选择，将直接显示结果:\n{decrypted}");
-                        break;
+                    Array.Clear(decryptedChars, 0, decryptedChars.Length);
+                    Array.Clear(decryptedBytes, 0, decryptedBytes.Length);
                 }
             }
-            catch (Exception ex)
+            finally
             {
-                Console.WriteLine($"\n解密失败: {ex.Message}");
+                Array.Clear(password, 0, password.Length);
             }
         }
 
-        static (string decryptedText, string debugInfo) DecryptText(string encryptedCustomBaseString, string password)
+        static (byte[] decryptedBytes, string debugInfo) DecryptText(string encryptedCustomBaseString, char[] password)
         {
-            var (shuffledCharset, charToValueMap, customBase) = GeneratePasswordDerivedCharset(password);
-            byte[] decodedBytes;
+            byte[] decryptedBytes = null;
+            string debugInfo = string.Empty;
+            byte[] kek = null;
+            byte[] decodedBytes = null;
+            byte[] cipherTextBytes = null;
+            byte[] salt = null;
+            byte[] gcmIv = null;
+            byte[] gcmTag = null;
+
             try
             {
-                decodedBytes = PasswordDerivedBaseStringToBytes(encryptedCustomBaseString, shuffledCharset, charToValueMap, customBase);
-            }
-            catch (FormatException ex)
-            {
-                throw new Exception("密文格式无效或密码不正确 (自定义编码解码失败)。", ex);
-            }
+                string passwordStr = new string(password);
+                var (shuffledCharset, charToValueMap, customBase) = GeneratePasswordDerivedCharset(passwordStr);
 
-            EnvelopeData envelope = null;
-
-            // Attempt 1: Treat decodedBytes as the direct JSON payload.
-            // This handles new mode (V2) and potentially old mode (V1) if it was encoded without a nonce.
-            try
-            {
-                string jsonString = Encoding.UTF8.GetString(decodedBytes);
-                var tempEnvelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString);
-                // Check for valid envelope structure (V must be "1" or "2")
-                if (tempEnvelope != null && !string.IsNullOrEmpty(tempEnvelope.V) &&
-                    (tempEnvelope.V == "1" || tempEnvelope.V == "2"))
-                {
-                    envelope = tempEnvelope;
-                }
-            }
-            catch (Exception) { /* Swallow and try next method if this fails */ }
-
-            // Attempt 2: If Attempt 1 failed or didn't yield a recognized envelope,
-            // try assuming an old mode structure with a prepended nonce.
-            if (envelope == null && decodedBytes.Length >= RANDOM_NONCE_LENGTH)
-            {
-                byte[] potentialJsonPayload = new byte[decodedBytes.Length - RANDOM_NONCE_LENGTH];
-                if (potentialJsonPayload.Length > 0) // Make sure there's something left after stripping nonce
-                {
-                    Buffer.BlockCopy(decodedBytes, RANDOM_NONCE_LENGTH, potentialJsonPayload, 0, potentialJsonPayload.Length);
-                    try
-                    {
-                        string jsonString = Encoding.UTF8.GetString(potentialJsonPayload);
-                        var tempEnvelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString);
-                        // After stripping a nonce, we expect V="1" for old mode.
-                        // If V="2" is found here, it's an inconsistent state (new mode format with a nonce),
-                        // so we only accept V="1".
-                        if (tempEnvelope != null && tempEnvelope.V == "1")
-                        {
-                            envelope = tempEnvelope;
-                        }
-                    }
-                    catch (Exception) { /* Swallow, envelope remains null if parsing fails */ }
-                }
-            }
-
-            if (envelope == null)
-            {
-                // This error message covers the user's reported issue and other parsing failures.
-                throw new Exception("解码后的数据无法识别为有效的加密格式 (JSON解析失败或版本不匹配)，可能是密码错误或密文损坏。");
-            }
-
-            byte[] salt;
-            try
-            {
-                salt = Convert.FromBase64String(envelope.S ?? throw new ArgumentNullException(nameof(envelope.S), "Salt 字段为空"));
-            }
-            catch (FormatException ex)
-            {
-                throw new Exception("Salt 格式错误，可能密文损坏。", ex);
-            }
-            // Removed ArgumentNullException catch here as it's covered by the ?? throw pattern.
-
-            int argon2MemorySizeKB = envelope.AM;
-            int argon2Iterations = envelope.AI;
-            int argon2Parallelism = envelope.AP;
-
-            if (argon2MemorySizeKB <= 0 || argon2Iterations <= 0 || argon2Parallelism <= 0)
-            {
-                throw new Exception($"从密文加载的 Argon2 参数无效或缺失 (Memory: {argon2MemorySizeKB}KB, Iterations: {argon2Iterations}, Parallelism: {argon2Parallelism})。密文可能已损坏或来自不兼容的版本。");
-            }
-
-            byte[] kek = DeriveKeyFromPassword(password, salt, 32, argon2MemorySizeKB, argon2Iterations, argon2Parallelism);
-
-            byte[] cipherTextBytes;
-            byte[] gcmIv;
-            byte[] gcmTag;
-            try
-            {
-                cipherTextBytes = Convert.FromBase64String(envelope.C ?? throw new ArgumentNullException(nameof(envelope.C), "CipherText 字段为空"));
-                gcmIv = Convert.FromBase64String(envelope.I ?? throw new ArgumentNullException(nameof(envelope.I), "GCM IV 字段为空"));
-                gcmTag = Convert.FromBase64String(envelope.T ?? throw new ArgumentNullException(nameof(envelope.T), "GCM Tag 字段为空"));
-            }
-            catch (FormatException ex)
-            {
-                throw new Exception("密文、IV 或 Tag 格式错误，可能密文损坏。", ex);
-            }
-            // Removed ArgumentNullException catch here as it's covered by the ?? throw pattern.
-
-
-            byte[] plainBytes = new byte[cipherTextBytes.Length];
-            string debugInfo;
-            string decryptedText; // Declare decryptedText outside the blocks
-
-            // The 'isOldMode' flag is removed; logic now directly uses envelope.V
-            if (envelope.V == "1")
-            {
-                // Old mode: Decrypt DEK with AES-CBC, then data with AES-GCM
-                byte[] encryptedDek;
-                byte[] dekIv;
                 try
                 {
-                    if (string.IsNullOrEmpty(envelope.K))
-                    {
-                        throw new FormatException("旧模式密文缺少 K 字段 (加密的DEK和IV)。");
-                    }
-                    string[] keyParts = envelope.K.Split(':');
-                    if (keyParts.Length != 2)
-                        throw new FormatException("加密密钥或 IV 格式错误 (K字段格式不对)。");
-                    encryptedDek = Convert.FromBase64String(keyParts[0]);
-                    dekIv = Convert.FromBase64String(keyParts[1]);
+                    decodedBytes = PasswordDerivedBaseStringToBytes(encryptedCustomBaseString, shuffledCharset, charToValueMap, customBase);
                 }
                 catch (FormatException ex)
                 {
-                    throw new Exception("旧模式的加密密钥(K)或其IV格式错误，可能密文损坏。", ex);
+                    throw new Exception("密文格式无效或密码不正确 (自定义编码解码失败)。", ex);
                 }
 
-                byte[] dek;
+                EnvelopeData envelope = null;
+                byte[] jsonPayloadToParse = null;
+                bool isV1StructureWithNonce = false;
+
                 try
                 {
-                    using (Aes aes = Aes.Create())
+                    string jsonString = Encoding.UTF8.GetString(decodedBytes);
+                    envelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+                    if (envelope != null && !string.IsNullOrEmpty(envelope.V))
                     {
-                        aes.KeySize = 256;
-                        aes.Mode = CipherMode.CBC;
-                        aes.Padding = PaddingMode.PKCS7;
-                        aes.Key = kek;
-                        aes.IV = dekIv;
-                        using (ICryptoTransform decryptor = aes.CreateDecryptor())
+                        jsonPayloadToParse = decodedBytes;
+                    }
+                }
+                catch { }
+
+                if (envelope == null && decodedBytes.Length > RANDOM_NONCE_LENGTH)
+                {
+                    byte[] potentialJsonPayload = new byte[decodedBytes.Length - RANDOM_NONCE_LENGTH];
+                    if (potentialJsonPayload.Length > 0)
+                    {
+                        Buffer.BlockCopy(decodedBytes, RANDOM_NONCE_LENGTH, potentialJsonPayload, 0, potentialJsonPayload.Length);
+                        try
                         {
-                            dek = decryptor.TransformFinalBlock(encryptedDek, 0, encryptedDek.Length);
+                            string jsonString = Encoding.UTF8.GetString(potentialJsonPayload);
+                            envelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+                            if (envelope != null && envelope.V == "1")
+                            {
+                                jsonPayloadToParse = potentialJsonPayload;
+                                isV1StructureWithNonce = true;
+                            }
                         }
+                        catch { }
                     }
                 }
-                catch (CryptographicException ex)
+
+                if (envelope == null)
                 {
-                    throw new Exception("DEK 解密失败，可能密码不正确或密文损坏。", ex);
+                    throw new Exception("解码后的数据无法识别为有效的加密格式 (JSON解析失败或版本不匹配)，可能是密码错误或密文损坏。");
                 }
 
                 try
                 {
-                    using (AesGcm aesGcm = new AesGcm(dek))
-                    {
-                        aesGcm.Decrypt(gcmIv, cipherTextBytes, gcmTag, plainBytes, null);
-                    }
+                    cipherTextBytes = Convert.FromBase64String(envelope.C ?? throw new ArgumentNullException(nameof(envelope.C), "CipherText 字段为空"));
                 }
-                catch (CryptographicException ex)
+                catch (FormatException ex) { throw new Exception("密文格式错误，可能密文损坏。", ex); }
+                catch (ArgumentNullException ex) { throw new Exception(ex.Message, ex); }
+
+                if (envelope.V == "1")
                 {
-                    throw new Exception("数据解密或认证失败 (旧模式)，可能密码不正确或密文已被篡改。", ex);
-                }
+                    byte[] encryptedDek;
+                    byte[] dekIv;
+                    byte[] dek = null;
+                    string externalNonceB64 = "N/A";
+                    if (isV1StructureWithNonce && decodedBytes.Length > RANDOM_NONCE_LENGTH)
+                    {
+                        byte[] noncePart = new byte[RANDOM_NONCE_LENGTH];
+                        Buffer.BlockCopy(decodedBytes, 0, noncePart, 0, RANDOM_NONCE_LENGTH);
+                        externalNonceB64 = Convert.ToBase64String(noncePart);
+                    }
 
-                decryptedText = Encoding.UTF8.GetString(plainBytes);
+                    try
+                    {
+                        salt = Convert.FromBase64String(envelope.S ?? throw new ArgumentNullException(nameof(envelope.S), "Salt 字段为空"));
+                        gcmIv = Convert.FromBase64String(envelope.I ?? throw new ArgumentNullException(nameof(envelope.I), "GCM IV 字段为空"));
+                        gcmTag = Convert.FromBase64String(envelope.T ?? throw new ArgumentNullException(nameof(envelope.T), "GCM Tag 字段为空"));
+                    }
+                    catch (FormatException ex) { throw new Exception("Salt、IV 或 Tag 格式错误，可能密文损坏。", ex); }
+                    catch (ArgumentNullException ex) { throw new Exception(ex.Message, ex); }
 
-                debugInfo = DebugMode ? $@"解密参数 (旧模式):
-- DEK (Base64): {Convert.ToBase64String(dek)}
+                    int argon2MemorySizeKB = envelope.AM;
+                    int argon2Iterations = envelope.AI;
+                    int argon2Parallelism = envelope.AP;
+
+                    if (argon2MemorySizeKB <= 0 || argon2Iterations <= 0 || argon2Parallelism <= 0)
+                    {
+                        throw new Exception($"从密文加载的 Argon2 参数无效或缺失 (Memory: {argon2MemorySizeKB}KB, Iterations: {argon2Iterations}, Parallelism: {argon2Parallelism})。密文可能已损坏或来自不兼容的版本。");
+                    }
+
+                    kek = DeriveKeyFromPassword(password, salt, 32, argon2MemorySizeKB, argon2Iterations, argon2Parallelism);
+
+                    try
+                    {
+                        if (string.IsNullOrEmpty(envelope.K))
+                        {
+                            throw new FormatException("双层加密(V1)密文缺少 K 字段 (加密的DEK和IV)。");
+                        }
+                        string[] keyParts = envelope.K.Split(':');
+                        if (keyParts.Length != 2)
+                            throw new FormatException("加密密钥或 IV 格式错误 (K字段格式不对)。");
+                        encryptedDek = Convert.FromBase64String(keyParts[0]);
+                        dekIv = Convert.FromBase64String(keyParts[1]);
+                    }
+                    catch (FormatException ex) { throw new Exception("双层加密(V1)的加密密钥(K)或其IV格式错误，可能密文损坏。", ex); }
+
+                    try
+                    {
+                        using (Aes aes = Aes.Create())
+                        {
+                            aes.KeySize = 256;
+                            aes.Mode = CipherMode.CBC;
+                            aes.Padding = PaddingMode.PKCS7;
+                            aes.Key = kek;
+                            aes.IV = dekIv;
+                            using (ICryptoTransform decryptor = aes.CreateDecryptor())
+                            {
+                                dek = decryptor.TransformFinalBlock(encryptedDek, 0, encryptedDek.Length);
+                            }
+                        }
+
+                        decryptedBytes = new byte[cipherTextBytes.Length];
+                        using (AesGcm aesGcm = new AesGcm(dek))
+                        {
+                            aesGcm.Decrypt(gcmIv, cipherTextBytes, gcmTag, decryptedBytes, null);
+                        }
+
+                        debugInfo = DebugMode ? $@"解密参数 (双层加密 V1):
+- DEK (Base64): {(dek != null ? Convert.ToBase64String(dek) : "Error/NotAvailable")} (Intermediate)
 - KEK (Base64): {Convert.ToBase64String(kek)}
 - Salt (Base64): {envelope.S}
-- DEK IV (Base64): {Convert.ToBase64String(dekIv)}
-- GCM IV (Base64): {envelope.I}
-- GCM Tag (Base64): {envelope.T}
+- DEK CBC IV (Base64): {Convert.ToBase64String(dekIv)}
+- Data GCM IV (Base64): {envelope.I}
+- Data GCM Tag (Base64): {envelope.T}
+- External Nonce (Base64, V1 structure): {externalNonceB64}
 - Argon2 Memory Size: {argon2MemorySizeKB} KB
 - Argon2 Iterations: {argon2Iterations}
 - Argon2 Parallelism: {argon2Parallelism}
 - Shuffled Charset: {shuffledCharset}
 - Custom Base: {customBase}" : string.Empty;
 
-            }
-            else if (envelope.V == "2")
-            {
-                // New mode: Decrypt data with AES-GCM using KEK
-                try
-                {
-                    using (AesGcm aesGcm = new AesGcm(kek))
-                    {
-                        aesGcm.Decrypt(gcmIv, cipherTextBytes, gcmTag, plainBytes, null);
+                        Array.Clear(dek, 0, dek.Length);
+                        Array.Clear(encryptedDek, 0, encryptedDek.Length);
+                        Array.Clear(dekIv, 0, dekIv.Length);
                     }
+                    catch (CryptographicException ex) { throw new Exception("DEK 解密或数据解密失败 (V1)，可能密码不正确或密文损坏。", ex); }
                 }
-                catch (CryptographicException ex)
+                else if (envelope.V == "2")
                 {
-                    throw new Exception("数据解密或认证失败 (新模式)，可能密码不正确或密文已被篡改。", ex);
-                }
+                    try
+                    {
+                        salt = Convert.FromBase64String(envelope.S ?? throw new ArgumentNullException(nameof(envelope.S), "Salt 字段为空"));
+                        gcmIv = Convert.FromBase64String(envelope.I ?? throw new ArgumentNullException(nameof(envelope.I), "GCM IV 字段为空"));
+                        gcmTag = Convert.FromBase64String(envelope.T ?? throw new ArgumentNullException(nameof(envelope.T), "GCM Tag 字段为空"));
+                    }
+                    catch (FormatException ex) { throw new Exception("Salt、IV 或 Tag 格式错误，可能密文损坏。", ex); }
+                    catch (ArgumentNullException ex) { throw new Exception(ex.Message, ex); }
 
-                decryptedText = Encoding.UTF8.GetString(plainBytes);
+                    int argon2MemorySizeKB = envelope.AM;
+                    int argon2Iterations = envelope.AI;
+                    int argon2Parallelism = envelope.AP;
 
-                debugInfo = DebugMode ? $@"解密参数 (新模式):
+                    if (argon2MemorySizeKB <= 0 || argon2Iterations <= 0 || argon2Parallelism <= 0)
+                    {
+                        throw new Exception($"从密文加载的 Argon2 参数无效或缺失 (Memory: {argon2MemorySizeKB}KB, Iterations: {argon2Iterations}, Parallelism: {argon2Parallelism})。密文可能已损坏或来自不兼容的版本。");
+                    }
+
+                    kek = DeriveKeyFromPassword(password, salt, 32, argon2MemorySizeKB, argon2Iterations, argon2Parallelism);
+
+                    try
+                    {
+                        decryptedBytes = new byte[cipherTextBytes.Length];
+                        using (AesGcm aesGcm = new AesGcm(kek))
+                        {
+                            aesGcm.Decrypt(gcmIv, cipherTextBytes, gcmTag, decryptedBytes, null);
+                        }
+
+                        debugInfo = DebugMode ? $@"解密参数 (直接加密 V2):
 - KEK (Base64): {Convert.ToBase64String(kek)}
 - Salt (Base64): {envelope.S}
-- GCM IV (Base64): {envelope.I}
-- GCM Tag (Base64): {envelope.T}
+- Data GCM IV (Base64): {envelope.I}
+- Data GCM Tag (Base64): {envelope.T}
 - Argon2 Memory Size: {argon2MemorySizeKB} KB
 - Argon2 Iterations: {argon2Iterations}
 - Argon2 Parallelism: {argon2Parallelism}
 - Shuffled Charset: {shuffledCharset}
 - Custom Base: {customBase}" : string.Empty;
+                    }
+                    catch (CryptographicException ex) { throw new Exception("数据解密或认证失败 (V2)，可能密码不正确或密文已被篡改。", ex); }
+                }
+                else if (envelope.V == "0.5")
+                {
+                    try
+                    {
+                        salt = Convert.FromBase64String(envelope.S ?? throw new ArgumentNullException(nameof(envelope.S), "Salt 字段为空"));
+                        // IV is present but not used in ECB
+                    }
+                    catch (FormatException ex) { throw new Exception("Salt 格式错误，可能密文损坏。", ex); }
+                    catch (ArgumentNullException ex) { throw new Exception(ex.Message, ex); }
+
+                    kek = DeriveKeySHA512(passwordStr, 32);
+
+                    try
+                    {
+                        decryptedBytes = new byte[cipherTextBytes.Length];
+                        using (Aes aes = Aes.Create())
+                        {
+                            aes.KeySize = 256;
+                            aes.Mode = CipherMode.ECB;
+                            aes.Padding = PaddingMode.PKCS7;
+                            aes.Key = kek;
+                            using (ICryptoTransform decryptor = aes.CreateDecryptor())
+                            {
+                                decryptedBytes = decryptor.TransformFinalBlock(cipherTextBytes, 0, cipherTextBytes.Length);
+                            }
+                        }
+
+                        debugInfo = DebugMode ? $@"解密参数 (盐值随机模式 V0.5):
+- KEK (Base64): {Convert.ToBase64String(kek)}
+- Salt (Base64): {envelope.S}
+- ECB IV (Base64, not used in ECB): {envelope.I}
+- Ciphertext (Base64): {envelope.C}
+- Shuffled Charset: {shuffledCharset}
+- Custom Base: {customBase}" : string.Empty;
+                    }
+                    catch (CryptographicException ex) { throw new Exception("数据解密失败 (V0.5)，可能密码不正确或密文损坏。", ex); }
+                }
+                else if (envelope.V == "0")
+                {
+                    // IV is present but not used in ECB
+                    kek = DeriveKeySHA512(passwordStr, 32);
+
+                    try
+                    {
+                        decryptedBytes = new byte[cipherTextBytes.Length];
+                        using (Aes aes = Aes.Create())
+                        {
+                            aes.KeySize = 256;
+                            aes.Mode = CipherMode.ECB;
+                            aes.Padding = PaddingMode.PKCS7;
+                            aes.Key = kek;
+                            using (ICryptoTransform decryptor = aes.CreateDecryptor())
+                            {
+                                decryptedBytes = decryptor.TransformFinalBlock(cipherTextBytes, 0, cipherTextBytes.Length);
+                            }
+                        }
+
+                        debugInfo = DebugMode ? $@"解密参数 (核心直加密模式 V0):
+- KEK (Base64): {Convert.ToBase64String(kek)}
+- ECB IV (Base64, not used in ECB): {envelope.I}
+- Ciphertext (Base64): {envelope.C}
+- Shuffled Charset: {shuffledCharset}
+- Custom Base: {customBase}" : string.Empty;
+                    }
+                    catch (CryptographicException ex) { throw new Exception("数据解密失败 (V0)，可能密码不正确或密文损坏。", ex); }
+                }
+                else
+                {
+                    throw new Exception($"不支持的密文版本: {envelope.V}");
+                }
             }
-            else
+            finally
             {
-                throw new Exception($"不支持的密文版本: {envelope.V}");
+                if (kek != null) Array.Clear(kek, 0, kek.Length);
+                if (decodedBytes != null) Array.Clear(decodedBytes, 0, decodedBytes.Length);
+                if (cipherTextBytes != null) Array.Clear(cipherTextBytes, 0, cipherTextBytes.Length);
+                if (salt != null) Array.Clear(salt, 0, salt.Length);
+                if (gcmIv != null) Array.Clear(gcmIv, 0, gcmIv.Length);
+                if (gcmTag != null) Array.Clear(gcmTag, 0, gcmTag.Length);
             }
-            return (decryptedText, debugInfo);
+
+            return (decryptedBytes, debugInfo);
         }
 
         static void RunCommandMode(string[] args)
@@ -1294,56 +1614,127 @@ namespace TextCrypt
             if (args.Length == 0 || args[0].ToLower() == "help" || args[0] == "--help" || args[0] == "-h")
             {
                 Console.WriteLine("TextCrypt 命令行用法:");
-                Console.WriteLine("  textcrypt encrypt <text_to_encrypt> <password> [old]");
+                Console.WriteLine("  textcrypt encrypt <text_to_encrypt> <password> [v1|v2|v0.5|v0]");
                 Console.WriteLine("  textcrypt decrypt <encrypted_text> <password>");
-                Console.WriteLine("  textcrypt encryptfile <input_file_path> <output_file_path> <password> [old]");
+                Console.WriteLine("  textcrypt encryptfile <input_file_path> <output_file_path> <password> [v1|v2|v0.5|v0]");
                 Console.WriteLine("  textcrypt decryptfile <input_file_path> <output_file_path> <password>");
                 Console.WriteLine("  textcrypt help | --help | -h");
-                Console.WriteLine("  注意: 添加 'old' 参数使用旧加密模式（不推荐）。");
+                Console.WriteLine("  注意: [v1|v2|v0.5|v0] 指定加密模式: v1=双层加密, v2=直接加密(默认), v0.5=盐值随机模式, v0=核心直加密模式");
                 return;
             }
 
             var command = args[0].ToLower();
-            bool useOldMode = args.Length > 3 && args[args.Length - 1].ToLower() == "old";
+            string mode = "V2"; // Default mode
+            bool hasModeFlag = args.Length >= (command.Contains("file") ? 5 : 4);
+            if (hasModeFlag)
+            {
+                string modeFlag = args[args.Length - 1].ToLower();
+                if (modeFlag == "v1" || modeFlag == "v2" || modeFlag == "v0.5" || modeFlag == "v0")
+                {
+                    mode = modeFlag.ToUpper();
+                }
+            }
+            int passwordArgIndex = command.Contains("file") ? 3 : 2;
 
             try
             {
                 switch (command)
                 {
                     case "encrypt":
-                        if (args.Length < 3) throw new ArgumentException("参数不足: textcrypt encrypt <text> <password> [old]");
+                        if (args.Length < 3) throw new ArgumentException("参数不足: textcrypt encrypt <text> <password> [v1|v2|v0.5|v0]");
                         Console.Error.WriteLine("正在加密...");
-                        var (encrypted, debugEnc) = EncryptText(args[1], args[2], useOldMode);
-                        if (DebugMode) Console.Error.WriteLine(debugEnc);
-                        Console.WriteLine(encrypted);
+                        char[] encryptPassword = args[passwordArgIndex].ToCharArray();
+                        try
+                        {
+                            byte[] plaintextBytes = Encoding.UTF8.GetBytes(args[1]);
+                            try
+                            {
+                                var (encrypted, debugEnc) = EncryptText(plaintextBytes, encryptPassword, mode);
+                                if (DebugMode) Console.Error.WriteLine(debugEnc);
+                                Console.WriteLine(encrypted);
+                            }
+                            finally
+                            {
+                                Array.Clear(plaintextBytes, 0, plaintextBytes.Length);
+                            }
+                        }
+                        finally
+                        {
+                            Array.Clear(encryptPassword, 0, encryptPassword.Length);
+                        }
                         break;
 
                     case "decrypt":
                         if (args.Length < 3) throw new ArgumentException("参数不足: textcrypt decrypt <encrypted_text> <password>");
                         Console.Error.WriteLine("正在解密...");
-                        var (decrypted, debugDec) = DecryptText(args[1], args[2]);
-                        if (DebugMode) Console.Error.WriteLine(debugDec);
-                        Console.WriteLine(decrypted);
+                        char[] decryptPassword = args[2].ToCharArray();
+                        try
+                        {
+                            var (decryptedBytes, debugDec) = DecryptText(args[1], decryptPassword);
+                            try
+                            {
+                                if (DebugMode) Console.Error.WriteLine(debugDec);
+                                Console.WriteLine(Encoding.UTF8.GetString(decryptedBytes));
+                            }
+                            finally
+                            {
+                                Array.Clear(decryptedBytes, 0, decryptedBytes.Length);
+                            }
+                        }
+                        finally
+                        {
+                            Array.Clear(decryptPassword, 0, decryptPassword.Length);
+                        }
                         break;
 
                     case "encryptfile":
-                        if (args.Length < 4) throw new ArgumentException("参数不足: textcrypt encryptfile <inputfile> <outputfile> <password> [old]");
-                        var text = File.ReadAllText(args[1]);
-                        Console.Error.WriteLine("正在加密文件...");
-                        var (encResult, debugEncFile) = EncryptText(text, args[3], useOldMode);
-                        if (DebugMode) Console.Error.WriteLine(debugEncFile);
-                        File.WriteAllText(args[2], encResult);
-                        Console.WriteLine($"加密完成: {args[2]}");
+                        if (args.Length < 4) throw new ArgumentException("参数不足: textcrypt encryptfile <inputfile> <outputfile> <password> [v1|v2|v0.5|v0]");
+                        char[] encryptFilePassword = args[passwordArgIndex].ToCharArray();
+                        try
+                        {
+                            byte[] fileTextBytes = File.ReadAllBytes(args[1]);
+                            try
+                            {
+                                Console.Error.WriteLine("正在加密文件...");
+                                var (encResult, debugEncFile) = EncryptText(fileTextBytes, encryptFilePassword, mode);
+                                if (DebugMode) Console.Error.WriteLine(debugEncFile);
+                                File.WriteAllText(args[2], encResult);
+                                Console.WriteLine($"加密完成: {args[2]}");
+                            }
+                            finally
+                            {
+                                Array.Clear(fileTextBytes, 0, fileTextBytes.Length);
+                            }
+                        }
+                        finally
+                        {
+                            Array.Clear(encryptFilePassword, 0, encryptFilePassword.Length);
+                        }
                         break;
 
                     case "decryptfile":
                         if (args.Length < 4) throw new ArgumentException("参数不足: textcrypt decryptfile <inputfile> <outputfile> <password>");
-                        var encText = File.ReadAllText(args[1]);
-                        Console.Error.WriteLine("正在解密文件...");
-                        var (decResult, debugDecFile) = DecryptText(encText, args[3]);
-                        if (DebugMode) Console.Error.WriteLine(debugDecFile);
-                        File.WriteAllText(args[2], decResult);
-                        Console.WriteLine($"解密完成: {args[2]}");
+                        char[] decryptFilePassword = args[3].ToCharArray();
+                        try
+                        {
+                            string encText = File.ReadAllText(args[1]);
+                            Console.Error.WriteLine("正在解密文件...");
+                            var (decResultBytes, debugDecFile) = DecryptText(encText, decryptFilePassword);
+                            try
+                            {
+                                if (DebugMode) Console.Error.WriteLine(debugDecFile);
+                                File.WriteAllBytes(args[2], decResultBytes);
+                                Console.WriteLine($"解密完成: {args[2]}");
+                            }
+                            finally
+                            {
+                                Array.Clear(decResultBytes, 0, decResultBytes.Length);
+                            }
+                        }
+                        finally
+                        {
+                            Array.Clear(decryptFilePassword, 0, decryptFilePassword.Length);
+                        }
                         break;
 
                     default:
@@ -1355,6 +1746,8 @@ namespace TextCrypt
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"错误: {ex.Message}");
+                if (DebugMode && ex.InnerException != null) Console.Error.WriteLine($"内部错误: {ex.InnerException.Message}");
+                if (DebugMode && ex.StackTrace != null) Console.Error.WriteLine($"堆栈跟踪: {ex.StackTrace}");
             }
         }
 
@@ -1404,10 +1797,18 @@ namespace TextCrypt
         {
             byte[] keyBytes = Encoding.UTF8.GetBytes(checkPhrase ?? string.Empty);
             byte[] messageBytes = Encoding.UTF8.GetBytes(cipherText);
-            using (var hmac = new HMACSHA512(keyBytes))
+            try
             {
-                byte[] macBytes = hmac.ComputeHash(messageBytes);
-                return Convert.ToBase64String(macBytes);
+                using (var hmac = new HMACSHA512(keyBytes))
+                {
+                    byte[] macBytes = hmac.ComputeHash(messageBytes);
+                    return Convert.ToBase64String(macBytes);
+                }
+            }
+            finally
+            {
+                Array.Clear(keyBytes, 0, keyBytes.Length);
+                Array.Clear(messageBytes, 0, messageBytes.Length);
             }
         }
 
