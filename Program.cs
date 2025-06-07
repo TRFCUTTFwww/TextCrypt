@@ -225,12 +225,35 @@ namespace TextCrypt
             }
         }
 
+        private static Random random = new Random();
+        private static List<string> slogans = new List<string>()
+    {
+        "=== 隐私高于一切 ===",
+        "=== 只是一个随机文本生成器 ===",
+        "=== 你无需知晓 ===",
+        "=== 密文伪装 ==="
+        // 你可以在这里添加更多标语
+    };
         static void RunInteractiveMode()
         {
+            int randomIndex = random.Next(0, slogans.Count); // 生成一个0到slogans.Count-1之间的随机数
+            string randomSlogan = slogans[randomIndex];
             while (true)
             {
-                Console.WriteLine("\n=== TextCrypt ===");
-                Console.WriteLine("便捷文本加密解密工具");
+                Console.WriteLine(@"
+ooooooooooooo                           .     .oooooo.                                       .   
+8'   888   `8                         .o8    d8P'  `Y8b                                    .o8   
+     888       .ooooo.  oooo    ooo .o888oo 888          oooo d8b oooo    ooo oo.ooooo.  .o888oo 
+     888      d88' `88b  `88b..8P'    888   888          `888""""8P  `88.  .8'   888' `88b   888   
+     888      888ooo888    Y888'      888   888           888       `88..8'    888   888   888   
+     888      888    .o  .o8""'88b     888 . `88b    ooo   888        `888'     888   888   888 . 
+    o888o     `Y8bod8P' o88'   888o   ""888""  `Y8bood8P'  d888b        .8'      888bod8P'   ""888"" 
+                                                                  .o..P'       888               
+                                                                  `Y8P'       o888o              
+                                                                                                 
+");
+                Console.WriteLine(randomSlogan);
+                Console.WriteLine("便捷式离线文本加密解密工具");
                 Console.WriteLine($"调试模式: {(DebugMode ? "开启" : "关闭")}");
                 Console.WriteLine($"当前 Argon2 参数 - 内存: {CurrentConfig.MemorySizeKB} KB, 迭代: {CurrentConfig.Iterations}, 并行: {CurrentConfig.Parallelism}");
                 Console.WriteLine("请选择操作:");
