@@ -302,38 +302,58 @@ namespace TextCrypt
                 }
             }
         }
+
+        static byte[] ReadKeyFromFile(string filePath)
+        {
+            if (!File.Exists(filePath))
+                throw new FileNotFoundException($"密钥文件 {filePath} 不存在。");
+
+            string keyContent = File.ReadAllText(filePath).Trim();
+            // 移除 PEM 头尾（如果存在）
+            keyContent = keyContent
+                .Replace("-----BEGIN PRIVATE KEY-----", "")
+                .Replace("-----END PRIVATE KEY-----", "")
+                .Replace("-----BEGIN EC PRIVATE KEY-----", "")
+                .Replace("-----END EC PRIVATE KEY-----", "")
+                .Replace("-----BEGIN PUBLIC KEY-----", "")
+                .Replace("-----END PUBLIC KEY-----", "")
+                .Replace("\n", "")
+                .Replace("\r", "")
+                .Trim();
+
+            try
+            {
+                return Convert.FromBase64String(keyContent);
+            }
+            catch (FormatException ex)
+            {
+                throw new CryptographicException($"密钥文件 {filePath} 的 Base64 格式无效。", ex);
+            }
+        }
         static void GenerateAndExportV3KeyPair()
         {
             Console.Clear();
             Console.WriteLine("\n=== 生成 V3 密钥对 ===");
             Console.WriteLine("V3 模式使用 ECIES (椭圆曲线集成加密方案) 非对称密钥对进行加密。");
-            Console.WriteLine("请为您的密钥对提供一个名称前缀。例如，输入 'my_secret' 会生成 'my_secret.private.pem' 和 'my_secret.public.pub'。");
-
             Console.Write("\n请输入密钥文件的名称前缀: ");
             string keyNamePrefix = Console.ReadLine();
 
             if (string.IsNullOrWhiteSpace(keyNamePrefix))
             {
                 Console.WriteLine("密钥名称前缀不能为空，操作取消。");
-                Console.WriteLine("\n按任意键返回主菜单...");
-                Console.ReadKey();
                 return;
             }
 
-            // 获取当前程序的运行目录
             string currentDirectory = Directory.GetCurrentDirectory();
             string privateKeyFilePath = Path.Combine(currentDirectory, $"{keyNamePrefix}.private.pem");
             string publicKeyFilePath = Path.Combine(currentDirectory, $"{keyNamePrefix}.public.pub");
 
-            // 检查文件是否已存在以避免意外覆盖
             if (File.Exists(privateKeyFilePath) || File.Exists(publicKeyFilePath))
             {
-                Console.Write($"\n警告: 文件 '{keyNamePrefix}.private.pem' 或 '{keyNamePrefix}.public.pub' 已存在于 '{currentDirectory}'。是否覆盖? (y/n): ");
+                Console.Write($"\n警告: 文件已存在。是否覆盖? (y/n): ");
                 if (Console.ReadLine()?.ToLower() != "y")
                 {
                     Console.WriteLine("操作已取消。");
-                    Console.WriteLine("\n按任意键返回主菜单...");
-                    Console.ReadKey();
                     return;
                 }
             }
@@ -343,20 +363,26 @@ namespace TextCrypt
             {
                 using (var ecdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP521))
                 {
-                    // 导出私钥（PKCS#8 格式）和公钥（SubjectPublicKeyInfo 格式），均Base64编码
+                    // 私钥（PKCS#8，PEM 格式）
                     string privateKeyBase64 = Convert.ToBase64String(ecdh.ExportPkcs8PrivateKey());
+                    string privateKeyPem =
+                        "-----BEGIN PRIVATE KEY-----\n" +
+                        string.Join("\n", privateKeyBase64.Chunk(64).Select(chunk => new string(chunk))) +
+                        "\n-----END PRIVATE KEY-----\n";
+
+                    // 公钥（SubjectPublicKeyInfo，PEM 格式）
                     string publicKeyBase64 = Convert.ToBase64String(ecdh.ExportSubjectPublicKeyInfo());
+                    string publicKeyPem =
+                        "-----BEGIN PUBLIC KEY-----\n" +
+                        string.Join("\n", publicKeyBase64.Chunk(64).Select(chunk => new string(chunk))) +
+                        "\n-----END PUBLIC KEY-----\n";
 
-                    // 保存私钥
-                    File.WriteAllText(privateKeyFilePath, privateKeyBase64);
+                    File.WriteAllText(privateKeyFilePath, privateKeyPem);
                     Console.WriteLine($"\n√ 私钥已保存到: {privateKeyFilePath}");
-
-                    // 保存公钥
-                    File.WriteAllText(publicKeyFilePath, publicKeyBase64);
+                    File.WriteAllText(publicKeyFilePath, publicKeyPem);
                     Console.WriteLine($"\n√ 公钥已保存到: {publicKeyFilePath}");
 
-                    Console.WriteLine("\n重要提示: 请妥善保管您的私钥文件，它决定了您是否能够解密信息！");
-                    Console.WriteLine("您可以将公钥文件安全地分享给他人，用于加密发给您的信息。");
+                    Console.WriteLine("\n密钥文件采用标准 PEM 格式，兼容 OpenSSL 等工具。");
                 }
             }
             catch (Exception ex)
@@ -709,8 +735,17 @@ namespace TextCrypt
             byte[] gcmTag = new byte[16];
             byte[] cipherTextBytes = new byte[plaintextBytes.Length];
 
+
             try
             {
+                recipientPublicKeyBase64 = recipientPublicKeyBase64
+            .Replace("-----BEGIN PUBLIC KEY-----", "")
+            .Replace("-----END PUBLIC KEY-----", "")
+            .Replace("\n", "")
+            .Replace("\r", "")
+            .Trim();
+
+
                 // 1. 导入接收方的公钥
                 recipientPublicKeyBytes = Convert.FromBase64String(recipientPublicKeyBase64);
                 using var recipientPublicKey = ECDiffieHellman.Create();
@@ -1669,7 +1704,7 @@ namespace TextCrypt
                 {
                     case "1":
                         Console.WriteLine($"\n解密结果:\n{new string(decryptedChars)}");
-                        Console.WriteLine("\n按下回车返回主菜单");
+                        Console.WriteLine("\n==========================================================\nTextCrypt 不对用户解密结果的内容承担任何责任，解密结果完全基于用户提供的输入和操作\n按下回车返回主菜单");
                         Console.ReadLine();
                         break;
                     case "2":
@@ -1736,6 +1771,12 @@ namespace TextCrypt
 
             try
             {
+                privateKeyBase64 = privateKeyBase64
+            .Replace("-----BEGIN PRIVATE KEY-----", "")
+            .Replace("-----END PRIVATE KEY-----", "")
+            .Replace("\n", "")
+            .Replace("\r", "")
+            .Trim();
                 // 1. 从私钥派生出公钥，用于后续的自定义解码
                 privateKeyBytes = Convert.FromBase64String(privateKeyBase64);
                 using var ecdh = ECDiffieHellman.Create();
@@ -1866,7 +1907,7 @@ namespace TextCrypt
                     {
                         case "1":
                             Console.WriteLine($"\n解密结果:\n{new string(decryptedChars)}");
-                            Console.WriteLine("\n按下回车返回主菜单");
+                            Console.WriteLine("\n==========================================================\nTextCrypt 不对用户解密结果的内容承担任何责任，解密结果完全基于用户提供的输入和操作\n按下回车返回主菜单");
                             Console.ReadLine();
                             break;
                         case "2":
