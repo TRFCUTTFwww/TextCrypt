@@ -1500,7 +1500,7 @@ ooooooooooooo                           .     .oooooo.                          
             if (choice == "2")
             {
                 Console.Write("请输入文件路径: ");
-                var filePath = Console.ReadLine();
+                var filePath = Console.ReadLine()?.Trim('"');
 
                 if (!File.Exists(filePath))
                 {
@@ -1726,7 +1726,7 @@ ooooooooooooo                           .     .oooooo.                          
                 switch (outputChoice)
                 {
                     case "1":
-                        Console.WriteLine($"\n解密结果:\n{new string(decryptedChars)}");
+                        Console.WriteLine($"\n解密结果:\n==========================================================\n{new string(decryptedChars)}");
                         Console.WriteLine("\n==========================================================\nTextCrypt 不对用户解密结果的内容承担任何责任，解密结果完全基于用户提供的输入和操作\n按下回车返回主菜单");
                         Console.ReadLine();
                         break;
