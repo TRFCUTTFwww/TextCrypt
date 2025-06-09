@@ -336,7 +336,7 @@ ooooooooooooo                           .     .oooooo.                          
             Console.WriteLine("1. 输入密文");
             Console.WriteLine("2. 选择密文文件");
             Console.WriteLine("3. 返回");
-
+            Console.Write("\n请输入选择:");
             var choice = Console.ReadLine();
             string encryptedText = null;
             string selectedFile = null;
