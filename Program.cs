@@ -226,6 +226,7 @@ namespace TextCrypt
             {
                 RunCommandMode(args);
             }
+
         }
 
         private static Random random = new Random();
@@ -258,6 +259,15 @@ ooooooooooooo                           .     .oooooo.                          
 ");
                 Console.WriteLine(randomSlogan);
                 Console.WriteLine("便捷式离线文本加密解密工具");
+#if DEBUG
+                Console.WriteLine("当前版本：DEBUG，已自动启用调试模式");
+                DebugMode = true;
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("!!!严禁在生产环境中使用调试版本!!!");
+                Console.ResetColor();
+#else
+        Console.WriteLine("当前版本：Release");
+#endif
                 Console.WriteLine($"调试模式: {(DebugMode ? "开启" : "关闭")}");
                 Console.WriteLine($"当前 Argon2 参数 - 内存: {CurrentConfig.MemorySizeKB} KB, 迭代: {CurrentConfig.Iterations}, 并行: {CurrentConfig.Parallelism}");
                 Console.WriteLine("请选择操作:");
@@ -265,13 +275,14 @@ ooooooooooooo                           .     .oooooo.                          
                 Console.WriteLine("2. 解密文本");
                 Console.WriteLine("3. 打开加密数据库");
                 Console.WriteLine("4. 清除历史输出");
-                Console.WriteLine("5. 切换调试模式");
-                Console.WriteLine("6. 退出程序");
-                Console.WriteLine("7. 修改 Argon2 参数");
-                Console.WriteLine("8. V3密钥管理"); // 直接显示生成密钥对的功能
-                Console.WriteLine("9. 挂载模式");
-                Console.WriteLine("10. 批量处理模式");
-                Console.Write("请输入选择 (1-10): ");
+                //Console.WriteLine("5. 切换调试模式");
+                
+                Console.WriteLine("5. 修改 Argon2 参数");
+                Console.WriteLine("6. V3密钥管理"); // 直接显示生成密钥对的功能
+                Console.WriteLine("7. 挂载模式");
+                Console.WriteLine("8. 批量处理模式");
+                Console.WriteLine("9. 退出程序");
+                Console.Write("请输入选择 (1-9): ");
 
                 var choice = Console.ReadLine();
 
@@ -290,7 +301,14 @@ ooooooooooooo                           .     .oooooo.                          
                         Console.Clear();
                         Console.WriteLine("历史输出已清除。");
                         break;
-                    case "5":
+                    case "debug":
+#if DEBUG
+
+#else
+                    Console.WriteLine("Release版本禁止开启调试模式！");
+                    break;
+#endif
+
                         Console.WriteLine("是否要切换调试模式？输入 'y' 确认，输入其他键取消：");
                         string confirm = Console.ReadLine()?.ToLower();
                         if (confirm == "y")
@@ -316,19 +334,19 @@ ooooooooooooo                           .     .oooooo.                          
                             Console.WriteLine("取消切换调试模式。");
                         }
                         break;
-                    case "6":
+                    case "9":
                         Console.WriteLine("感谢使用，再见！");
                         return;
-                    case "7":
+                    case "5":
                         ModifyArgon2Parameters();
                         break;
-                    case "8":
+                    case "6":
                         V3Main(); // 直接调用生成和导出方法
                         break;
-                    case "9":
+                    case "7":
                         mount();
                         break;
-                    case "10":
+                    case "8":
                         BatchInteractive();
                         break;
                     default:
@@ -2485,7 +2503,7 @@ ooooooooooooo                           .     .oooooo.                          
                             {
                                 (data, debug) = DecryptTextV3(line, recipientPrivateKeyBase64);
                             }
-                            Console.WriteLine("解密结果: " + Encoding.UTF8.GetString(data));
+                            Console.WriteLine("解密结果: \n" + Encoding.UTF8.GetString(data));
                             if (DebugMode && !string.IsNullOrEmpty(debug))
                                 Console.WriteLine("--- 调试信息 ---\n" + debug);
                         }
@@ -2503,7 +2521,7 @@ ooooooooooooo                           .     .oooooo.                          
                             {
                                 (encrypted, debug) = EncryptTextV3(plainBytes, recipientPublicKeyBase64);
                             }
-                            Console.WriteLine("加密结果: " + encrypted);
+                            Console.WriteLine("加密结果: \n" + encrypted);
                             if (DebugMode && !string.IsNullOrEmpty(debug))
                                 Console.WriteLine("--- 调试信息 ---\n" + debug);
                         }
