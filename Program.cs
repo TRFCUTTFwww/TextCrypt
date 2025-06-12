@@ -13,6 +13,13 @@ using Konscious.Security.Cryptography;
 using System.Text.Json.Serialization;
 using System.Runtime.InteropServices;
 using System.Security;
+using Spectre.Console;
+using TGColor = Terminal.Gui.Color;
+using TGDIM = Terminal.Gui.Dim;
+using TGPos = Terminal.Gui.Pos;
+// 如果你还用到了 Terminal.Gui.Attribute，也可以加上
+using TGAttribute = Terminal.Gui.Attribute;
+using NStack;
 
 namespace TextCrypt
 {
@@ -43,6 +50,33 @@ namespace TextCrypt
             public int AP { get; set; } // Argon2 Parallelism (for V1, V2)
         }
 
+        public enum PanelMode { Encrypt, Decrypt }
+
+
+        public class PanelState
+        {
+            public PanelMode CurrentMode { get; set; }
+            public string Name { get; set; }
+            public SecureString SecurePwd { get; set; }
+            public string RecipientPrivateKeyBase64 { get; set; }
+            public string RecipientPublicKeyBase64 { get; set; }
+            public bool UsePassword { get; set; }
+            public string CurrentPasswordMode { get; set; }
+            public Action RequestStopApplication { get; set; }
+
+            public Label PromptLabel { get; set; }
+            public TextField InputField { get; set; }
+            public TextView OutputView { get; set; }
+            // 保存 FrameView，以便在模式切换时更新标题
+            public FrameView ParentFrame { get; set; }
+
+            public List<string> History { get; } = new List<string>();
+            public int HistoryIndex { get; set; } = -1;
+
+            public string GetPromptText() =>
+                $"{(CurrentMode == PanelMode.Encrypt ? "加密" : "解密")} ({CurrentPasswordMode})> ";
+        }
+        enum Mode { Decrypt, Encrypt }
         class Config
         {
             public int MemorySizeKB { get; set; } = 1024 * 256; // 256MB
@@ -2377,178 +2411,368 @@ ooooooooooooo                           .     .oooooo.                          
                 return null;
             }
         }
-        static void BatchInteractive()
+        public static void BatchInteractive()
         {
             Console.WriteLine("\n=== 批量加/解密模式 ===");
             Console.WriteLine("1. 使用密码 (V0/V0.5/V1/V2)");
-            Console.WriteLine("2. 使用密钥文件 (V3)"); // 文本稍作修改以更准确
+            Console.WriteLine("2. 使用密钥文件 (V3)");
             Console.Write("请选择 (1/2): ");
-            var mode = Console.ReadLine();
-            bool usePassword = mode != "2";
+            var modeChoice = Console.ReadLine()?.Trim();
+            bool usePassword = modeChoice != "2";
 
-            // 密码模式：选择版本并读取密码；私钥模式：加载 .pem
-            string passwordMode = null;
             SecureString securePwd = null;
-
-            // V3 模式变量
-            string recipientPrivateKeyBase64 = null; // 用于解密
-            string recipientPublicKeyBase64 = null;  // 用于加密 (新)
+            string passwordMode = null;
+            string recipientPrivateKey = null;
+            string recipientPublicKey = null;
 
             if (usePassword)
             {
                 Console.WriteLine("\n可选加密版本：");
-                Console.WriteLine("1. V0   - 最基础模式，SHA-512 直接派生 AES key，速度最快，抗 GPU 能力最低");
-                Console.WriteLine("2. V0.5 - 加盐 + ECB 模式，中等安全，兼容性好");
-                Console.WriteLine("3. V1   - Argon2 强化 + CBC+GCM 双层加密，最高安全性，耗时稍长");
-                Console.WriteLine("4. V2   - Argon2 强化 + 单层 GCM，性能与安全均衡");
+                Console.WriteLine("1. V0    - 最基础模式");
+                Console.WriteLine("2. V0.5 - 加盐 + ECB");
+                Console.WriteLine("3. V1    - Argon2 + CBC+GCM");
+                Console.WriteLine("4. V2    - Argon2 + GCM");
                 Console.Write("请选择版本 (1-4): ");
-                var verChoice = Console.ReadLine()?.Trim();
-                switch (verChoice)
+                var ver = Console.ReadLine()?.Trim();
+                passwordMode = ver switch
                 {
-                    case "1": passwordMode = "V0"; break;
-                    case "2": passwordMode = "V0.5"; break;
-                    case "3": passwordMode = "V1"; break;
-                    case "4": passwordMode = "V2"; break;
-                    default:
-                        Console.WriteLine("无效选择，默认使用 V2");
-                        passwordMode = "V2";
-                        break;
-                }
+                    "1" => "V0",
+                    "2" => "V0.5",
+                    "3" => "V1",
+                    "4" => "V2",
+                    _ => "V2"
+                };
 
                 securePwd = ReadPasswordSecure("请输入密码: ");
-                if (securePwd.Length == 0)
+                if (securePwd == null || securePwd.Length == 0)
                 {
                     Console.WriteLine("密码不能为空，退出批量模式。");
                     return;
                 }
             }
-            else // V3 模式
+            else
             {
-                // 1. 加载用于解密的私钥
-                recipientPrivateKeyBase64 = SelectAndLoadPem(); // 假设此函数加载私钥
-                if (string.IsNullOrEmpty(recipientPrivateKeyBase64))
+                recipientPrivateKey = SelectAndLoadPem();
+                if (string.IsNullOrEmpty(recipientPrivateKey))
                 {
-                    Console.WriteLine("加载私钥失败，退出批量模式。");
+                    Console.WriteLine("加载私钥失败，退出。");
                     return;
                 }
-
-                // 2. 加载用于加密的公钥 (新功能)
-                recipientPublicKeyBase64 = SelectAndLoadPublicKey();
-                if (string.IsNullOrEmpty(recipientPublicKeyBase64))
+                recipientPublicKey = SelectAndLoadPublicKey();
+                if (string.IsNullOrEmpty(recipientPublicKey))
                 {
-                    Console.WriteLine("加载公钥失败，退出批量模式。");
+                    Console.WriteLine("加载公钥失败，退出。");
                     return;
                 }
             }
 
-            // 初始化交互循环
-            var currentMode = LineMode.Decrypt;
-            string prompt = "Decrypt> ";
+            Mode mode = Mode.Decrypt;
+            var buffer = new StringBuilder();
             var history = new List<string>();
             int historyIndex = 0;
-            var buffer = new StringBuilder();
+            int cursor = 0;
+            int scrollOffset = 0;
 
-            // Updated instructions reflecting the new toggle key
-            Console.WriteLine("\nAlt+A 切换模式, ↑/↓ 历史, Enter 执行, 输入 exit 回主菜单。");
+            Console.WriteLine("\nAlt+A 切换模式, Alt+S 清空, ↑/↓ 历史, ←/→ 编辑, Backspace 删除, Enter 执行, 输入 exit 退出。");
 
             while (true)
             {
-                // 重绘提示行
-                Console.SetCursorPosition(0, Console.CursorTop);
-                // Clear only the current line to prevent flickering
-                Console.Write(new string(' ', Console.WindowWidth > 0 ? Console.WindowWidth - 1 : 0));
-                Console.SetCursorPosition(0, Console.CursorTop);
-                Console.Write(prompt + buffer);
-
-                var keyInfo = Console.ReadKey(true);
-
-                // 模式切换 (Toggle with Alt+A)
-                if (keyInfo.Key == ConsoleKey.A && keyInfo.Modifiers.HasFlag(ConsoleModifiers.Alt))
+                // 1. 重绘当前行（含滚动处理与越界检查）
+                int top = Console.CursorTop;
+                int windowWidth;
+                try
                 {
-                    currentMode = currentMode == LineMode.Decrypt ? LineMode.Encrypt : LineMode.Decrypt;
-                    prompt = currentMode == LineMode.Decrypt ? "Decrypt> " : "Encrypt> ";
-                    historyIndex = history.Count;
-                    Console.WriteLine();
-                    Console.WriteLine($"模式已切换: {(currentMode == LineMode.Decrypt ? "解密" : "加密")}");
-                    continue;
+                    windowWidth = Console.WindowWidth;
+                    if (windowWidth <= 0) windowWidth = buffer.Length + 20;
+                }
+                catch
+                {
+                    // 如果无法获取（极少见），用一个足够大的值避免异常
+                    windowWidth = buffer.Length + 20;
                 }
 
-                // ... (历史浏览, 删除, 和字符输入部分代码保持不变) ...
+                // 清空整行
+                try
+                {
+                    Console.SetCursorPosition(0, top);
+                }
+                catch
+                {
+                    // 如果行位置不可设置，可尝试跳过清行
+                }
+                Console.Write(new string(' ', windowWidth));
+                try
+                {
+                    Console.SetCursorPosition(0, top);
+                }
+                catch { }
 
-                // 执行
-                if (keyInfo.Key == ConsoleKey.Enter)
+                // 写提示符
+                Console.ForegroundColor = mode == Mode.Encrypt ? ConsoleColor.Red : ConsoleColor.Green;
+                var prompt = mode == Mode.Decrypt ? "Decrypt> " : "Encrypt> ";
+                Console.Write(prompt);
+                Console.ResetColor();
+
+                // 可见区域宽度（提示符之后）
+                int availableWidth = windowWidth - prompt.Length;
+                if (availableWidth < 1) availableWidth = 1;
+
+                // 调整 scrollOffset，使光标总在可见区域内
+                if (cursor < scrollOffset)
+                {
+                    scrollOffset = cursor;
+                }
+                else if (cursor - scrollOffset >= availableWidth)
+                {
+                    scrollOffset = cursor - availableWidth + 1;
+                }
+
+                // 取可见子串
+                string visible;
+                if (buffer.Length <= availableWidth)
+                {
+                    visible = buffer.ToString();
+                    scrollOffset = 0;
+                }
+                else
+                {
+                    // 确保 scrollOffset 不越界
+                    if (scrollOffset < 0) scrollOffset = 0;
+                    if (scrollOffset > buffer.Length - 1) scrollOffset = Math.Max(0, buffer.Length - availableWidth);
+                    int len = Math.Min(buffer.Length - scrollOffset, availableWidth);
+                    visible = buffer.ToString(scrollOffset, len);
+                }
+                Console.Write(visible);
+
+                // 定位光标：prompt 长度 + (cursor - scrollOffset)
+                int cursorPos = prompt.Length + (cursor - scrollOffset);
+                if (cursorPos < 0) cursorPos = 0;
+                if (cursorPos >= windowWidth) cursorPos = windowWidth - 1;
+                try
+                {
+                    Console.SetCursorPosition(cursorPos, top);
+                }
+                catch
+                {
+                    // 忽略设置失败
+                }
+
+                // 2. 读取按键
+                var key = Console.ReadKey(intercept: true);
+
+                // Alt+A 切换模式
+                if (key.Key == ConsoleKey.A && key.Modifiers.HasFlag(ConsoleModifiers.Alt))
+                {
+                    mode = mode == Mode.Decrypt ? Mode.Encrypt : Mode.Decrypt;
+                    buffer.Clear(); cursor = 0; historyIndex = history.Count; scrollOffset = 0;
+                    Console.WriteLine(); // 换行让提示更明显
+                    continue;
+                }
+                // Alt+S 清空当前输入
+                if (key.Key == ConsoleKey.S && key.Modifiers.HasFlag(ConsoleModifiers.Alt))
+                {
+                    buffer.Clear(); cursor = 0; scrollOffset = 0;
+                    continue;
+                }
+                // 历史 上/下
+                if (key.Key == ConsoleKey.UpArrow)
+                {
+                    if (history.Count > 0 && historyIndex > 0)
+                    {
+                        historyIndex--;
+                        buffer.Clear().Append(history[historyIndex]);
+                        cursor = buffer.Length;
+                        scrollOffset = 0;
+                    }
+                    continue;
+                }
+                if (key.Key == ConsoleKey.DownArrow)
+                {
+                    if (history.Count > 0 && historyIndex < history.Count - 1)
+                    {
+                        historyIndex++;
+                        buffer.Clear().Append(history[historyIndex]);
+                    }
+                    else
+                    {
+                        historyIndex = history.Count;
+                        buffer.Clear();
+                    }
+                    cursor = buffer.Length;
+                    scrollOffset = 0;
+                    continue;
+                }
+                // 左/右移
+                if (key.Key == ConsoleKey.LeftArrow)
+                {
+                    if (cursor > 0) cursor--;
+                    continue;
+                }
+                if (key.Key == ConsoleKey.RightArrow)
+                {
+                    if (cursor < buffer.Length) cursor++;
+                    continue;
+                }
+                // Backspace 删除
+                if (key.Key == ConsoleKey.Backspace)
+                {
+                    if (cursor > 0)
+                    {
+                        buffer.Remove(cursor - 1, 1);
+                        cursor--;
+                        // 如果删除导致 scrollOffset 可缩小
+                        if (scrollOffset > 0 && buffer.Length - scrollOffset < availableWidth)
+                            scrollOffset = Math.Max(0, buffer.Length - availableWidth);
+                    }
+                    continue;
+                }
+                // Enter 提交
+                if (key.Key == ConsoleKey.Enter)
                 {
                     Console.WriteLine();
                     var line = buffer.ToString();
-                    if (line.Trim().ToLower() == "exit") break;
+                    if (line.Trim().ToLower() == "exit")
+                        break;
 
-                    if (!string.IsNullOrWhiteSpace(line))
-                    {
-                        history.Add(line);
-                        historyIndex = history.Count;
-                    }
+                    // 存历史
+                    history.Add(line);
+                    historyIndex = history.Count;
+                    scrollOffset = 0;
 
-                    try
+                    // 处理逻辑
+                    if (mode == Mode.Decrypt)
                     {
-                        if (currentMode == LineMode.Decrypt)
+                        byte[] data; string debug;
+                        if (usePassword)
                         {
-                            byte[] data; string debug;
-                            if (usePassword)
-                            {
-                                var pwdChars = SecureStringToCharArray(securePwd);
-                                (data, debug) = DecryptText(line, pwdChars);
-                                Array.Clear(pwdChars, 0, pwdChars.Length);
-                            }
-                            else // V3 解密使用私钥
-                            {
-                                (data, debug) = DecryptTextV3(line, recipientPrivateKeyBase64);
-                            }
-                            Console.WriteLine("解密结果: \n" + Encoding.UTF8.GetString(data));
-                            if (DebugMode && !string.IsNullOrEmpty(debug))
-                                Console.WriteLine("--- 调试信息 ---\n" + debug);
+                            var pwdChars = SecureStringToCharArray(securePwd);
+                            (data, debug) = DecryptText(line, pwdChars);
+                            Array.Clear(pwdChars, 0, pwdChars.Length);
                         }
-                        else // 加密模式
+                        else
                         {
-                            var plainBytes = Encoding.UTF8.GetBytes(line);
-                            string encrypted, debug;
-                            if (usePassword)
-                            {
-                                var pwdChars = SecureStringToCharArray(securePwd);
-                                (encrypted, debug) = EncryptText(plainBytes, pwdChars, passwordMode);
-                                Array.Clear(pwdChars, 0, pwdChars.Length);
-                            }
-                            else // V3 加密使用公钥
-                            {
-                                (encrypted, debug) = EncryptTextV3(plainBytes, recipientPublicKeyBase64);
-                            }
-                            Console.WriteLine("加密结果: \n" + encrypted);
-                            if (DebugMode && !string.IsNullOrEmpty(debug))
-                                Console.WriteLine("--- 调试信息 ---\n" + debug);
+                            (data, debug) = DecryptTextV3(line, recipientPrivateKey);
                         }
+                        Console.WriteLine("解密结果:\n" + Encoding.UTF8.GetString(data));
+                        if (!string.IsNullOrEmpty(debug))
+                            Console.WriteLine("--- Debug ---\n" + debug);
                     }
-                    catch (Exception ex)
+                    else
                     {
-                        Console.WriteLine((currentMode == LineMode.Decrypt ? "解密" : "加密") + "失败: " + ex.Message);
+                        var plain = Encoding.UTF8.GetBytes(line);
+                        string enc, debug;
+                        if (usePassword)
+                        {
+                            var pwdChars = SecureStringToCharArray(securePwd);
+                            (enc, debug) = EncryptText(plain, pwdChars, passwordMode);
+                            Array.Clear(pwdChars, 0, pwdChars.Length);
+                        }
+                        else
+                        {
+                            (enc, debug) = EncryptTextV3(plain, recipientPublicKey);
+                        }
+                        Console.WriteLine("加密结果:\n" + enc);
+                        if (!string.IsNullOrEmpty(debug))
+                            Console.WriteLine("--- Debug ---\n" + debug);
                     }
 
+                    // 重置 buffer
                     buffer.Clear();
+                    cursor = 0;
                     continue;
                 }
-
-                // 普通字符 (支持粘贴)
-                if (!char.IsControl(keyInfo.KeyChar))
+                // 普通字符 & 粘贴
+                if (!char.IsControl(key.KeyChar))
                 {
-                    buffer.Append(keyInfo.KeyChar);
+                    buffer.Insert(cursor, key.KeyChar);
+                    cursor++;
+                    // 继续读取缓冲区里的字符（粘贴）
                     while (Console.KeyAvailable)
                     {
-                        buffer.Append(Console.ReadKey(true).KeyChar);
+                        var c = Console.ReadKey(intercept: true).KeyChar;
+                        if (!char.IsControl(c))
+                        {
+                            buffer.Insert(cursor, c);
+                            cursor++;
+                        }
                     }
+                    continue;
                 }
+                // 其他键忽略
             }
 
             securePwd?.Dispose();
             Console.WriteLine("已退出批量加/解密模式。");
         }
+
+
+
+        private static string GetPromptText(PanelState state)
+        {
+            return $"{(state.CurrentMode == PanelMode.Encrypt ? "加密" : "解密")} ({state.CurrentPasswordMode})> ";
+        }
+
+       
+
+        /// <summary>
+        /// Checks if a command can be executed (i.e., exists in PATH).
+        /// Simple check for Unix-like systems, more complex on Windows.
+        /// </summary>
+        private static bool CanExecuteCommand(string command)
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                // On Windows, checking executability in PATH is more complex.
+                // For simple cases, just try to start it and catch errors.
+                // For this context, we'll assume common editors like notepad.exe, nano, vim are in system PATH or known.
+                // A robust solution would involve checking %PATH% manually.
+                try
+                {
+                    // This is a rough check to see if the command starts a process.
+                    // It's not foolproof as it might launch a GUI editor that detaches.
+                    using (var process = Process.Start(new ProcessStartInfo(command) { UseShellExecute = true, CreateNoWindow = true }))
+                    {
+                        if (process != null)
+                        {
+                            process.Kill(); // Don't actually run it, just check if it can start
+                            return true;
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    return false;
+                }
+                return false;
+            }
+            else // Linux/macOS
+            {
+                // Use 'which' command to check if executable exists in PATH
+                try
+                {
+                    var process = new Process
+                    {
+                        StartInfo = new ProcessStartInfo
+                        {
+                            FileName = "which",
+                            Arguments = command,
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            CreateNoWindow = true
+                        }
+                    };
+                    process.Start();
+                    process.WaitForExit();
+                    return process.ExitCode == 0; // 'which' returns 0 if command found
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
+
+
 
         static void DrawLine(string prompt, string text)
         {
