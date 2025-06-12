@@ -11,11 +11,14 @@ using System.Collections.Generic;
 using System.Linq;
 using Konscious.Security.Cryptography;
 using System.Text.Json.Serialization;
+using System.Runtime.InteropServices;
+using System.Security;
 
 namespace TextCrypt
 {
     class Program
     {
+        enum LineMode { Encrypt, Decrypt }
         // Database entry structure
         class EncryptedEntry
         {
@@ -267,7 +270,8 @@ ooooooooooooo                           .     .oooooo.                          
                 Console.WriteLine("7. 修改 Argon2 参数");
                 Console.WriteLine("8. V3密钥管理"); // 直接显示生成密钥对的功能
                 Console.WriteLine("9. 挂载模式");
-                Console.Write("请输入选择 (1-9): ");
+                Console.WriteLine("10. 批量处理模式");
+                Console.Write("请输入选择 (1-10): ");
 
                 var choice = Console.ReadLine();
 
@@ -323,6 +327,9 @@ ooooooooooooo                           .     .oooooo.                          
                         break;
                     case "9":
                         mount();
+                        break;
+                    case "10":
+                        BatchInteractive();
                         break;
                     default:
                         Console.WriteLine("无效的选择，请重试。");
@@ -501,7 +508,7 @@ ooooooooooooo                           .     .oooooo.                          
                             continue;
                         }
 
-                        Console.Write("\n编辑完成？ (y - 完成并继续 / r - 重新编辑 / c - 取消操作): ");
+                        Console.Write("\n编辑完成？ (y - 完成并继续(对于内容有改动) / r - 重新编辑 / c - 取消操作(对于仅查看)): ");
                         string confirmation = Console.ReadLine()?.ToLower();
 
                         if (confirmation == "y")
@@ -1099,8 +1106,8 @@ ooooooooooooo                           .     .oooooo.                          
             {
                 Console.WriteLine($"\n重新生成公钥失败: {ex.Message}");
             }
-            Console.WriteLine("\n按任意键返回主菜单...");
-            Console.ReadKey();
+            //Console.WriteLine("\n按任意键返回主菜单...");
+            //Console.ReadKey();
         }
         static void ListPublicKeysSHA512()
         {
@@ -1141,8 +1148,8 @@ ooooooooooooo                           .     .oooooo.                          
                 }
             }
 
-            Console.WriteLine("\n按任意键返回主菜单...");
-            Console.ReadKey();
+            //Console.WriteLine("\n按任意键返回主菜单...");
+            //Console.ReadKey();
         }
         static void GenerateAndExportV3KeyPair()
         {
@@ -1203,8 +1210,8 @@ ooooooooooooo                           .     .oooooo.                          
             {
                 Console.WriteLine($"\n生成或保存密钥对失败: {ex.Message}");
             }
-            Console.WriteLine("\n按任意键返回主菜单...");
-            Console.ReadKey();
+            //Console.WriteLine("\n按任意键返回主菜单...");
+            //Console.ReadKey();
         }
         static void EncryptInteractive()
         {
@@ -2278,44 +2285,427 @@ ooooooooooooo                           .     .oooooo.                          
             }
         }
 
-        static void DecryptInteractive()
+        static void BatchInteractive()
         {
-            Console.WriteLine("\n解密文本来源:");
-            Console.WriteLine("1. 直接输入密文");
-            Console.WriteLine("2. 从文件读取");
+            Console.WriteLine("\n=== 批量加/解密模式 ===");
+            Console.WriteLine("1. 使用密码 (V0/V0.5/V1/V2)");
+            Console.WriteLine("2. 使用私钥文件 (V3)");
             Console.Write("请选择 (1/2): ");
+            var mode = Console.ReadLine();
+            bool usePassword = mode != "2";
 
-            var choice = Console.ReadLine();
-            string encryptedText;
+            // 密码模式：选择版本并读取密码；私钥模式：加载 .pem
+            string passwordMode = null;
+            SecureString securePwd = null;
+            string recipientPublicKeyBase64 = null;
 
-            if (choice == "2")
+            if (usePassword)
             {
-                Console.Write("请输入文件路径: ");
-                var filePath = Console.ReadLine()?.Trim('"');
-
-                if (!File.Exists(filePath))
+                Console.WriteLine("\n可选加密版本：");
+                Console.WriteLine("1. V0   - 最基础模式，SHA-512 直接派生 AES key，速度最快，抗 GPU 能力最低");
+                Console.WriteLine("2. V0.5 - 加盐 + ECB 模式，中等安全，兼容性好");
+                Console.WriteLine("3. V1   - Argon2 强化 + CBC+GCM 双层加密，最高安全性，耗时稍长");
+                Console.WriteLine("4. V2   - Argon2 强化 + 单层 GCM，性能与安全均衡");
+                Console.Write("请选择版本 (1-4): ");
+                var verChoice = Console.ReadLine()?.Trim();
+                switch (verChoice)
                 {
-                    Console.WriteLine("文件不存在。");
-                    return;
+                    case "1": passwordMode = "V0"; break;
+                    case "2": passwordMode = "V0.5"; break;
+                    case "3": passwordMode = "V1"; break;
+                    case "4": passwordMode = "V2"; break;
+                    default:
+                        Console.WriteLine("无效选择，默认使用 V2");
+                        passwordMode = "V2";
+                        break;
                 }
 
-                try
+                securePwd = ReadPasswordSecure("请输入密码: ");
+                if (securePwd.Length == 0)
                 {
-                    encryptedText = File.ReadAllText(filePath);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"读取文件失败: {ex.Message}");
+                    Console.WriteLine("密码不能为空，退出批量模式。");
                     return;
                 }
             }
             else
             {
-                Console.WriteLine("请输入密文:");
-                encryptedText = Console.ReadLine();
+                recipientPublicKeyBase64 = SelectAndLoadPem();
+                if (string.IsNullOrEmpty(recipientPublicKeyBase64))
+                {
+                    Console.WriteLine("加载私钥失败，退出批量模式。");
+                    return;
+                }
             }
 
-            DecryptInteractiveRouter(encryptedText);
+            // 初始化交互循环
+            var currentMode = LineMode.Decrypt;
+            string prompt = "Decrypt> ";
+            var history = new List<string>();
+            int historyIndex = 0;
+            var buffer = new StringBuilder();
+
+            // Updated instructions reflecting the new toggle key
+            Console.WriteLine("\nAlt+A 切换模式, ↑/↓ 历史, Enter 执行, 输入 exit 回主菜单。");
+
+            while (true)
+            {
+                // 重绘提示行
+                Console.SetCursorPosition(0, Console.CursorTop);
+                // Clear only the current line to prevent flickering
+                Console.Write(new string(' ', Console.WindowWidth > 0 ? Console.WindowWidth - 1 : 0));
+                Console.SetCursorPosition(0, Console.CursorTop);
+                Console.Write(prompt + buffer);
+
+                var keyInfo = Console.ReadKey(true);
+
+                // 模式切换 (Toggle with Alt+A)
+                if (keyInfo.Key == ConsoleKey.A && keyInfo.Modifiers.HasFlag(ConsoleModifiers.Alt))
+                {
+                    currentMode = currentMode == LineMode.Decrypt ? LineMode.Encrypt : LineMode.Decrypt;
+                    prompt = currentMode == LineMode.Decrypt ? "Decrypt> " : "Encrypt> ";
+                    //buffer.Clear();
+                    historyIndex = history.Count;
+
+                    // Add a confirmation message for the mode switch
+                    Console.WriteLine(); // Move to a new line for the message
+                    Console.WriteLine($"模式已切换: {(currentMode == LineMode.Decrypt ? "解密" : "加密")}");
+                    continue;
+                }
+
+                // 历史浏览
+                if (keyInfo.Key == ConsoleKey.UpArrow)
+                {
+                    if (history.Count > 0)
+                    {
+                        historyIndex = Math.Max(0, historyIndex - 1);
+                        buffer.Clear().Append(history[historyIndex]);
+                    }
+                    continue;
+                }
+                if (keyInfo.Key == ConsoleKey.DownArrow)
+                {
+                    if (history.Count > 0 && historyIndex < history.Count - 1)
+                    {
+                        historyIndex++;
+                        buffer.Clear().Append(history[historyIndex]);
+                    }
+                    else
+                    {
+                        // If at the end of history, clear the buffer
+                        historyIndex = history.Count;
+                        buffer.Clear();
+                    }
+                    continue;
+                }
+
+                // 删除
+                if (keyInfo.Key == ConsoleKey.Backspace && buffer.Length > 0)
+                {
+                    buffer.Length--;
+                    continue;
+                }
+
+                // 执行
+                if (keyInfo.Key == ConsoleKey.Enter)
+                {
+                    Console.WriteLine();
+                    var line = buffer.ToString();
+                    if (line.Trim().ToLower() == "exit") break;
+
+                    if (!string.IsNullOrWhiteSpace(line))
+                    {
+                        history.Add(line);
+                        historyIndex = history.Count;
+                    }
+
+                    try
+                    {
+                        if (currentMode == LineMode.Decrypt)
+                        {
+                            byte[] data; string debug;
+                            if (usePassword)
+                            {
+                                var pwdChars = SecureStringToCharArray(securePwd);
+                                (data, debug) = DecryptText(line, pwdChars);
+                                Array.Clear(pwdChars, 0, pwdChars.Length);
+                            }
+                            else
+                            {
+                                (data, debug) = DecryptTextV3(line, recipientPublicKeyBase64);
+                            }
+                            Console.WriteLine("解密结果: " + Encoding.UTF8.GetString(data));
+                            if (DebugMode && !string.IsNullOrEmpty(debug))
+                                Console.WriteLine("--- 调试信息 ---\n" + debug);
+                        }
+                        else
+                        {
+                            var plainBytes = Encoding.UTF8.GetBytes(line);
+                            string encrypted, debug;
+                            if (usePassword)
+                            {
+                                var pwdChars = SecureStringToCharArray(securePwd);
+                                (encrypted, debug) = EncryptText(plainBytes, pwdChars, passwordMode);
+                                Array.Clear(pwdChars, 0, pwdChars.Length);
+                            }
+                            else
+                            {
+                                (encrypted, debug) = EncryptTextV3(plainBytes, recipientPublicKeyBase64);
+                            }
+                            Console.WriteLine("加密结果: " + encrypted);
+                            if (DebugMode && !string.IsNullOrEmpty(debug))
+                                Console.WriteLine("--- 调试信息 ---\n" + debug);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine((currentMode == LineMode.Decrypt ? "解密" : "加密") + "失败: " + ex.Message);
+                    }
+
+                    buffer.Clear();
+                    continue;
+                }
+
+                // 普通字符 (支持粘贴)
+                if (!char.IsControl(keyInfo.KeyChar))
+                {
+                    buffer.Append(keyInfo.KeyChar);
+
+                    // *** PASTE FIX ***
+                    // Greedily read all available characters from the input buffer at once.
+                    // This processes the entire paste before the next screen redraw,
+                    // preventing the visual corruption error.
+                    while (Console.KeyAvailable)
+                    {
+                        buffer.Append(Console.ReadKey(true).KeyChar);
+                    }
+                }
+            }
+
+            securePwd?.Dispose();
+            Console.WriteLine("已退出批量加/解密模式。");
+        }
+    
+    static void DrawLine(string prompt, string text)
+        {
+            Console.SetCursorPosition(0, Console.CursorTop);
+            Console.Write(new string(' ', Console.BufferWidth));
+            Console.SetCursorPosition(0, Console.CursorTop);
+            Console.Write(prompt + text);
+        }
+        static void DecryptInteractive()
+        {
+            while (true)
+            {
+                
+                Console.WriteLine("1. 单次解密 (输入密文或文件)");
+                //Console.WriteLine("2. 批量解密模式");
+                Console.WriteLine("2. 从文件读取然后单次解密");
+                Console.WriteLine("0. 退出");
+                Console.Write("请选择 (0-2): ");
+
+                switch (Console.ReadLine())
+                {
+                    case "1":
+                        Console.Write("请输入密文: ");
+                        var single = Console.ReadLine();
+                        DecryptInteractiveRouter(single);
+                        break;
+
+                    case "299":
+                        DecryptBatchMode();
+                        break;
+
+                    case "2":
+                        Console.Write("请输入文件路径: ");
+                        var path = Console.ReadLine()?.Trim('"');
+                        if (File.Exists(path))
+                        {
+                            var text = File.ReadAllText(path);
+                            DecryptInteractiveRouter(text);
+                        }
+                        else
+                        {
+                            Console.WriteLine("文件不存在。");
+                        }
+                        break;
+
+                    case "0":
+                        return;
+
+                    default:
+                        Console.WriteLine("无效选项，请重试。");
+                        break;
+                }
+            }
+        }
+
+        static void DecryptBatchMode()
+        {
+            Console.WriteLine("\n=== 批量解密模式 ===");
+            Console.WriteLine("1. 使用密码 (V0/V0.5/V1/V2)");
+            Console.WriteLine("2. 使用私钥文件 (V3)");
+            Console.Write("请选择 (1/2): ");
+            var mode = Console.ReadLine();
+            bool usePassword = mode != "2";
+
+            SecureString securePwd = null;
+            string privateKeyBase64 = null;
+
+            if (usePassword)
+            {
+                securePwd = ReadPasswordSecure("请输入密码: ");
+                if (securePwd.Length == 0)
+                {
+                    Console.WriteLine("密码不能为空，退出批量模式。");
+                    return;
+                }
+            }
+            else
+            {
+                privateKeyBase64 = SelectAndLoadPem();
+                if (string.IsNullOrEmpty(privateKeyBase64))
+                {
+                    Console.WriteLine("加载私钥失败，退出批量模式。");
+                    return;
+                }
+            }
+
+            Console.WriteLine("\n请输入要解密的密文，输入 ‘exit’ 回到主菜单。");
+            while (true)
+            {
+                Console.Write("\n密文> ");
+                var text = Console.ReadLine();
+                if (text?.Trim().ToLower() == "exit")
+                    break;
+
+                try
+                {
+                    byte[] data;
+                    string info;
+                    if (usePassword)
+                    {
+                        var pwdChars = SecureStringToCharArray(securePwd);
+                        (data, info) = DecryptText(text, pwdChars);
+                        Array.Clear(pwdChars, 0, pwdChars.Length);
+                    }
+                    else
+                    {
+                        (data, info) = DecryptTextV3(text, privateKeyBase64);
+                    }
+
+                    Console.WriteLine("解密结果:");
+                    Console.WriteLine(Encoding.UTF8.GetString(data));
+
+                    if (DebugMode && !string.IsNullOrEmpty(info))
+                    {
+                        Console.WriteLine("--- 调试信息 ---");
+                        Console.WriteLine(info);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"解密失败: {ex.Message}");
+                }
+            }
+
+            securePwd?.Dispose();
+            Console.WriteLine("已退出批量解密模式。");
+        }
+
+        /// <summary>
+        /// 列出当前目录下所有 .pem 私钥文件，让用户选择加载
+        /// </summary>
+        static string SelectAndLoadPem()
+        {
+            var cwd = Directory.GetCurrentDirectory();
+            var files = Directory.GetFiles(cwd, "*.pem");
+
+            Console.WriteLine("可用私钥文件：");
+            if (files.Length > 0)
+            {
+                for (int i = 0; i < files.Length; i++)
+                    Console.WriteLine($"{i + 1}. {Path.GetFileName(files[i])}");
+                Console.WriteLine("0. 手动输入私钥路径");
+                Console.Write("请选择编号 (0 或 1-{files.Length}): ");
+                var input = Console.ReadLine();
+                if (int.TryParse(input, out int idx))
+                {
+                    if (idx == 0)
+                        return ReadPemPath();
+                    if (idx >= 1 && idx <= files.Length)
+                        return File.ReadAllText(files[idx - 1]).Trim();
+                }
+                Console.WriteLine("无效选择，退出。");
+                return null;
+            }
+            else
+            {
+                Console.WriteLine("当前目录下未找到 .pem 文件，需手动输入私钥路径。");
+                return ReadPemPath();
+            }
+        }
+
+        /// <summary>
+        /// 手动输入 PEM 文件路径并加载，自动去除双引号
+        /// </summary>
+        static string ReadPemPath()
+        {
+            Console.Write("请输入私钥文件路径 (.pem): ");
+            var path = Console.ReadLine()?.Trim().Trim('"');
+            if (!File.Exists(path))
+            {
+                Console.WriteLine("文件不存在。");
+                return null;
+            }
+            return File.ReadAllText(path).Trim();
+        }
+
+        /// <summary>
+        /// 安全读取密码到 SecureString
+        /// </summary>
+        static SecureString ReadPasswordSecure(string prompt)
+        {
+            Console.Write(prompt);
+            var secure = new SecureString();
+            while (true)
+            {
+                var key = Console.ReadKey(true); // true表示不显示输入的字符
+                if (key.Key == ConsoleKey.Enter) break;
+                if (key.Key == ConsoleKey.Backspace && secure.Length > 0)
+                {
+                    secure.RemoveAt(secure.Length - 1);
+                    // 不需要写任何字符到控制台，保持空白
+                }
+                else if (!char.IsControl(key.KeyChar))
+                {
+                    secure.AppendChar(key.KeyChar);
+                    // 不显示*号，保持空白
+                }
+            }
+            Console.WriteLine();
+            secure.MakeReadOnly();
+            return secure;
+        }
+
+        /// <summary>
+        /// 将 SecureString 转换为 char[]，使用后请清零并释放
+        /// </summary>
+        static char[] SecureStringToCharArray(SecureString secure)
+        {
+            if (secure == null) return null;
+            IntPtr ptr = Marshal.SecureStringToGlobalAllocUnicode(secure);
+            try
+            {
+                int length = secure.Length;
+                var chars = new char[length];
+                for (int i = 0; i < length; i++)
+                    chars[i] = (char)Marshal.ReadInt16(ptr, i * 2);
+                return chars;
+            }
+            finally
+            {
+                Marshal.ZeroFreeGlobalAllocUnicode(ptr);
+            }
         }
 
         static void DecryptInteractiveRouter(string encryptedText)
