@@ -2491,6 +2491,20 @@ ooooooooooooo                           .     .oooooo.                          
                     Height = 1
                 };
 
+                // [新增] Windows用户提示标签
+                Label windowsWarningLabel = null;
+                if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+                {
+                    windowsWarningLabel = new Label("提示: 因Windows终端特性, 按钮定位可能不准, 请尽量点击按钮左侧区域。")
+                    {
+                        X = 1,
+                        Y = 2, // 放置在状态标签下方
+                        Width = Dim.Fill() - 2,
+                        Height = 1,
+                        ColorScheme = Colors.Error // 使用醒目的颜色
+                    };
+                }
+
                 // 大输入框
                 var textView = new TextView()
                 {
@@ -2847,6 +2861,11 @@ ooooooooooooo                           .     .oooooo.                          
 
                 // 添加控件到窗口 - 按从左到右，从上到下的顺序添加
                 win.Add(statusLabel);
+                // [新增] 添加Windows警告标签到窗口
+                if (windowsWarningLabel != null)
+                {
+                    win.Add(windowsWarningLabel);
+                }
                 win.Add(textView);
 
                 // 第一行按钮按顺序添加
@@ -2916,6 +2935,7 @@ ooooooooooooo                           .     .oooooo.                          
 
             Console.WriteLine("已退出批量加/解密模式。");
         }
+
 
 
 
