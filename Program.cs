@@ -2492,18 +2492,7 @@ ooooooooooooo                           .     .oooooo.                          
                 };
 
                 // [新增] Windows用户提示标签
-                Label windowsWarningLabel = null;
-                if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
-                {
-                    windowsWarningLabel = new Label("提示: 因Windows终端特性, 按钮定位可能不准, 请尽量点击按钮左侧区域。")
-                    {
-                        X = 1,
-                        Y = 2, // 放置在状态标签下方
-                        Width = Dim.Fill() - 2,
-                        Height = 1,
-                        ColorScheme = Colors.Error // 使用醒目的颜色
-                    };
-                }
+                
 
                 // 大输入框
                 var textView = new TextView()
@@ -2599,6 +2588,18 @@ ooooooooooooo                           .     .oooooo.                          
                     ColorScheme = Colors.Base
                 };
 
+                Label windowsWarningLabel = null;
+                if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+                {
+                    windowsWarningLabel = new Label("提示: 因Windows终端特性, 按钮定位可能不准, 请尽量点击按钮左侧区域。")
+                    {
+                        X = 1,
+                        Y = Pos.Bottom(resultLabel) + 2, // 放置在状态标签下方
+                        Width = Dim.Fill() - 2,
+                        Height = 1,
+                        ColorScheme = Colors.Error // 使用醒目的颜色
+                    };
+                }
                 // 加密并复制按钮事件
                 encryptCopyBtn.Clicked += () =>
                 {
@@ -2936,83 +2937,6 @@ ooooooooooooo                           .     .oooooo.                          
             Console.WriteLine("已退出批量加/解密模式。");
         }
 
-
-
-
-        private static string GetPromptText(PanelState state)
-        {
-            return $"{(state.CurrentMode == PanelMode.Encrypt ? "加密" : "解密")} ({state.CurrentPasswordMode})> ";
-        }
-
-       
-
-        /// <summary>
-        /// Checks if a command can be executed (i.e., exists in PATH).
-        /// Simple check for Unix-like systems, more complex on Windows.
-        /// </summary>
-        private static bool CanExecuteCommand(string command)
-        {
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                // On Windows, checking executability in PATH is more complex.
-                // For simple cases, just try to start it and catch errors.
-                // For this context, we'll assume common editors like notepad.exe, nano, vim are in system PATH or known.
-                // A robust solution would involve checking %PATH% manually.
-                try
-                {
-                    // This is a rough check to see if the command starts a process.
-                    // It's not foolproof as it might launch a GUI editor that detaches.
-                    using (var process = Process.Start(new ProcessStartInfo(command) { UseShellExecute = true, CreateNoWindow = true }))
-                    {
-                        if (process != null)
-                        {
-                            process.Kill(); // Don't actually run it, just check if it can start
-                            return true;
-                        }
-                    }
-                }
-                catch (Exception)
-                {
-                    return false;
-                }
-                return false;
-            }
-            else // Linux/macOS
-            {
-                // Use 'which' command to check if executable exists in PATH
-                try
-                {
-                    var process = new Process
-                    {
-                        StartInfo = new ProcessStartInfo
-                        {
-                            FileName = "which",
-                            Arguments = command,
-                            UseShellExecute = false,
-                            RedirectStandardOutput = true,
-                            CreateNoWindow = true
-                        }
-                    };
-                    process.Start();
-                    process.WaitForExit();
-                    return process.ExitCode == 0; // 'which' returns 0 if command found
-                }
-                catch
-                {
-                    return false;
-                }
-            }
-        }
-
-
-
-        static void DrawLine(string prompt, string text)
-        {
-            Console.SetCursorPosition(0, Console.CursorTop);
-            Console.Write(new string(' ', Console.BufferWidth));
-            Console.SetCursorPosition(0, Console.CursorTop);
-            Console.Write(prompt + text);
-        }
         static void DecryptInteractive()
         {
             while (true)
