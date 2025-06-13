@@ -2466,201 +2466,231 @@ ooooooooooooo                           .     .oooooo.                          
                 }
             }
 
-            Mode mode = Mode.Decrypt;
-            var buffer = new StringBuilder();
-            var history = new List<string>();
-            int historyIndex = 0;
-            int cursor = 0;
-            int scrollOffset = 0;
+            // 启动Terminal.Gui界面
+            Application.Init();
 
-            Console.WriteLine("\nAlt+A 切换模式, Alt+S 清空, ↑/↓ 历史, ←/→ 编辑, Backspace 删除, Enter 执行, 输入 exit 退出。");
-
-            while (true)
+            try
             {
-                // 1. 重绘当前行（含滚动处理与越界检查）
-                int top = Console.CursorTop;
-                int windowWidth;
-                try
-                {
-                    windowWidth = Console.WindowWidth;
-                    if (windowWidth <= 0) windowWidth = buffer.Length + 20;
-                }
-                catch
-                {
-                    // 如果无法获取（极少见），用一个足够大的值避免异常
-                    windowWidth = buffer.Length + 20;
-                }
+                var top = Application.Top;
 
-                // 清空整行
-                try
+                // 创建主窗口
+                var win = new Window("批量加/解密工具")
                 {
-                    Console.SetCursorPosition(0, top);
-                }
-                catch
-                {
-                    // 如果行位置不可设置，可尝试跳过清行
-                }
-                Console.Write(new string(' ', windowWidth));
-                try
-                {
-                    Console.SetCursorPosition(0, top);
-                }
-                catch { }
+                    X = 0,
+                    Y = 1,
+                    Width = Dim.Fill(),
+                    Height = Dim.Fill()
+                };
 
-                // 写提示符
-                Console.ForegroundColor = mode == Mode.Encrypt ? ConsoleColor.Red : ConsoleColor.Green;
-                var prompt = mode == Mode.Decrypt ? "Decrypt> " : "Encrypt> ";
-                Console.Write(prompt);
-                Console.ResetColor();
+                // 状态标签
+                var statusLabel = new Label($"模式: {(usePassword ? $"密码模式 ({passwordMode})" : "密钥文件模式 (V3)")}")
+                {
+                    X = 1,
+                    Y = 1,
+                    Width = Dim.Fill() - 2,
+                    Height = 1
+                };
 
-                // 可见区域宽度（提示符之后）
-                int availableWidth = windowWidth - prompt.Length;
-                if (availableWidth < 1) availableWidth = 1;
+                // 大输入框
+                var textView = new TextView()
+                {
+                    X = 1,
+                    Y = 3,
+                    Width = Dim.Fill() - 2,
+                    Height = Dim.Fill() - 8,  // 增加底部空间
+                    Text = "",
+                    WordWrap = true
+                };
 
-                // 调整 scrollOffset，使光标总在可见区域内
-                if (cursor < scrollOffset)
-                {
-                    scrollOffset = cursor;
-                }
-                else if (cursor - scrollOffset >= availableWidth)
-                {
-                    scrollOffset = cursor - availableWidth + 1;
-                }
+                // 计算按钮行的Y位置
+                var buttonRow1Y = Pos.Bottom(textView) + 1;
+                var buttonRow2Y = Pos.Bottom(textView) + 2;
 
-                // 取可见子串
-                string visible;
-                if (buffer.Length <= availableWidth)
+                // 第一行按钮 - 使用更大的间距和宽度
+                var encryptBtn = new Button("加密 (F1)")
                 {
-                    visible = buffer.ToString();
-                    scrollOffset = 0;
-                }
-                else
-                {
-                    // 确保 scrollOffset 不越界
-                    if (scrollOffset < 0) scrollOffset = 0;
-                    if (scrollOffset > buffer.Length - 1) scrollOffset = Math.Max(0, buffer.Length - availableWidth);
-                    int len = Math.Min(buffer.Length - scrollOffset, availableWidth);
-                    visible = buffer.ToString(scrollOffset, len);
-                }
-                Console.Write(visible);
+                    X = 3,
+                    Y = buttonRow1Y,
+                    Width = 16,
+                    Height = 1
+                };
 
-                // 定位光标：prompt 长度 + (cursor - scrollOffset)
-                int cursorPos = prompt.Length + (cursor - scrollOffset);
-                if (cursorPos < 0) cursorPos = 0;
-                if (cursorPos >= windowWidth) cursorPos = windowWidth - 1;
-                try
+                var decryptBtn = new Button("解密 (F2)")
                 {
-                    Console.SetCursorPosition(cursorPos, top);
-                }
-                catch
-                {
-                    // 忽略设置失败
-                }
+                    X = 22,  // 3 + 16 + 3 = 22
+                    Y = buttonRow1Y,
+                    Width = 16,
+                    Height = 1
+                };
 
-                // 2. 读取按键
-                var key = Console.ReadKey(intercept: true);
+                var copyBtn = new Button("复制 (F3)")
+                {
+                    X = 41,  // 22 + 16 + 3 = 41
+                    Y = buttonRow1Y,
+                    Width = 16,
+                    Height = 1
+                };
 
-                // Alt+A 切换模式
-                if (key.Key == ConsoleKey.A && key.Modifiers.HasFlag(ConsoleModifiers.Alt))
+                var clearBtn = new Button("清空 (F4)")
                 {
-                    mode = mode == Mode.Decrypt ? Mode.Encrypt : Mode.Decrypt;
-                    buffer.Clear(); cursor = 0; historyIndex = history.Count; scrollOffset = 0;
-                    Console.WriteLine(); // 换行让提示更明显
-                    continue;
-                }
-                // Alt+S 清空当前输入
-                if (key.Key == ConsoleKey.S && key.Modifiers.HasFlag(ConsoleModifiers.Alt))
+                    X = 60,  // 41 + 16 + 3 = 60
+                    Y = buttonRow1Y,
+                    Width = 16,
+                    Height = 1
+                };
+
+                var exitBtn = new Button("退出 (ESC)")
                 {
-                    buffer.Clear(); cursor = 0; scrollOffset = 0;
-                    continue;
-                }
-                // 历史 上/下
-                if (key.Key == ConsoleKey.UpArrow)
+                    X = 79,  // 60 + 16 + 3 = 79
+                    Y = buttonRow1Y,
+                    Width = 18,
+                    Height = 1
+                };
+
+                // 第二行按钮 - 使用更大的间距
+                var encryptCopyBtn = new Button("加密并复制 (F5)")
                 {
-                    if (history.Count > 0 && historyIndex > 0)
+                    X = 3,
+                    Y = buttonRow2Y,
+                    Width = 24,
+                    Height = 1
+                };
+
+                var pasteDecryptBtn = new Button("粘贴并解密 (F6)")
+                {
+                    X = 30,  // 3 + 24 + 3 = 30
+                    Y = buttonRow2Y,
+                    Width = 24,
+                    Height = 1
+                };
+
+#if DEBUG
+                // 切换调试模式按钮 (F7)
+                var toggleDebugBtn = new Button("切换调试 (F7)")
+                {
+                    X = 57,  // 30 + 24 + 3 = 57
+                    Y = buttonRow2Y,
+                    Width = 22,
+                    Height = 1
+                };
+#endif
+
+                // 结果显示标签 - 调整位置
+                var resultLabel = new Label("准备就绪")
+                {
+                    X = 2,
+                    Y = Pos.Bottom(textView) + 4,  // 调整位置，在按钮下方
+                    Width = Dim.Fill() - 4,
+                    Height = 1,
+                    ColorScheme = Colors.Base
+                };
+
+                // 加密并复制按钮事件
+                encryptCopyBtn.Clicked += () =>
+                {
+                    encryptBtn.OnClicked();              // 先执行加密
+                    // 延迟一下再复制，确保加密完成
+                    Application.MainLoop.AddTimeout(TimeSpan.FromMilliseconds(100), (loop) =>
                     {
-                        historyIndex--;
-                        buffer.Clear().Append(history[historyIndex]);
-                        cursor = buffer.Length;
-                        scrollOffset = 0;
-                    }
-                    continue;
-                }
-                if (key.Key == ConsoleKey.DownArrow)
-                {
-                    if (history.Count > 0 && historyIndex < history.Count - 1)
-                    {
-                        historyIndex++;
-                        buffer.Clear().Append(history[historyIndex]);
-                    }
-                    else
-                    {
-                        historyIndex = history.Count;
-                        buffer.Clear();
-                    }
-                    cursor = buffer.Length;
-                    scrollOffset = 0;
-                    continue;
-                }
-                // 左/右移
-                if (key.Key == ConsoleKey.LeftArrow)
-                {
-                    if (cursor > 0) cursor--;
-                    continue;
-                }
-                if (key.Key == ConsoleKey.RightArrow)
-                {
-                    if (cursor < buffer.Length) cursor++;
-                    continue;
-                }
-                // Backspace 删除
-                if (key.Key == ConsoleKey.Backspace)
-                {
-                    if (cursor > 0)
-                    {
-                        buffer.Remove(cursor - 1, 1);
-                        cursor--;
-                        // 如果删除导致 scrollOffset 可缩小
-                        if (scrollOffset > 0 && buffer.Length - scrollOffset < availableWidth)
-                            scrollOffset = Math.Max(0, buffer.Length - availableWidth);
-                    }
-                    continue;
-                }
-                // Enter 提交
-                if (key.Key == ConsoleKey.Enter)
-                {
-                    Console.WriteLine();
-                    var line = buffer.ToString();
-                    if (line.Trim().ToLower() == "exit")
-                        break;
+                        copyBtn.OnClicked();             // 再执行复制
+                        return false;
+                    });
+                };
 
-                    // 存历史
-                    history.Add(line);
-                    historyIndex = history.Count;
-                    scrollOffset = 0;
-
-                    // 处理逻辑
-                    if (mode == Mode.Decrypt)
+                // 粘贴并解密按钮事件 - 修复逻辑
+                pasteDecryptBtn.Clicked += () =>
+                {
+                    try
                     {
-                        byte[] data; string debug;
-                        if (usePassword)
+                        // 从剪贴板读取并放入 textView
+                        if (Clipboard.TryGetClipboardData(out var clip))
                         {
-                            var pwdChars = SecureStringToCharArray(securePwd);
-                            (data, debug) = DecryptText(line, pwdChars);
-                            Array.Clear(pwdChars, 0, pwdChars.Length);
+                            var clipboardContent = clip.ToString();
+                            if (string.IsNullOrEmpty(clipboardContent))
+                            {
+                                resultLabel.Text = "剪贴板内容为空";
+                                resultLabel.ColorScheme = Colors.Error;
+                                return;
+                            }
+
+                            textView.Text = clipboardContent;
+                            resultLabel.Text = "已粘贴，正在解密...";
+                            resultLabel.ColorScheme = Colors.Base;
+
+                            // 延迟执行解密，确保界面更新完成
+                            Application.MainLoop.AddTimeout(TimeSpan.FromMilliseconds(100), (loop) =>
+                            {
+                                try
+                                {
+                                    byte[] data;
+                                    string debug;
+
+                                    if (usePassword)
+                                    {
+                                        var pwdChars = SecureStringToCharArray(securePwd);
+                                        (data, debug) = DecryptText(clipboardContent, pwdChars);
+                                        Array.Clear(pwdChars, 0, pwdChars.Length);
+                                    }
+                                    else
+                                    {
+                                        (data, debug) = DecryptTextV3(clipboardContent, recipientPrivateKey);
+                                    }
+
+                                    var decryptedText = Encoding.UTF8.GetString(data);
+                                    textView.Text = decryptedText;
+                                    resultLabel.Text = "粘贴并解密完成";
+                                    resultLabel.ColorScheme = Colors.Base;
+
+                                    if (!string.IsNullOrEmpty(debug))
+                                    {
+                                        MessageBox.Query("Debug信息", debug, "确定");
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    resultLabel.Text = $"解密失败: {ex.Message}";
+                                    resultLabel.ColorScheme = Colors.Error;
+                                }
+                                return false;
+                            });
                         }
                         else
                         {
-                            (data, debug) = DecryptTextV3(line, recipientPrivateKey);
+                            resultLabel.Text = "无法读取剪贴板内容";
+                            resultLabel.ColorScheme = Colors.Error;
                         }
-                        Console.WriteLine("解密结果:\n" + Encoding.UTF8.GetString(data));
-                        if (!string.IsNullOrEmpty(debug))
-                            Console.WriteLine("--- Debug ---\n" + debug);
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        var plain = Encoding.UTF8.GetBytes(line);
+                        resultLabel.Text = $"粘贴失败: {ex.Message}";
+                        resultLabel.ColorScheme = Colors.Error;
+                    }
+                };
+
+#if DEBUG
+                toggleDebugBtn.Clicked += () =>
+                {
+                    DebugMode = !DebugMode;
+                    resultLabel.Text = $"调试模式：{(DebugMode ? "开启" : "关闭")}";
+                };
+#endif
+
+                // 加密按钮事件
+                encryptBtn.Clicked += () =>
+                {
+                    try
+                    {
+                        var inputText = textView.Text.ToString();
+                        if (string.IsNullOrEmpty(inputText))
+                        {
+                            resultLabel.Text = "输入内容为空";
+                            resultLabel.ColorScheme = Colors.Error;
+                            return;
+                        }
+
+                        var plain = Encoding.UTF8.GetBytes(inputText);
                         string enc, debug;
+
                         if (usePassword)
                         {
                             var pwdChars = SecureStringToCharArray(securePwd);
@@ -2671,37 +2701,219 @@ ooooooooooooo                           .     .oooooo.                          
                         {
                             (enc, debug) = EncryptTextV3(plain, recipientPublicKey);
                         }
-                        Console.WriteLine("加密结果:\n" + enc);
-                        if (!string.IsNullOrEmpty(debug))
-                            Console.WriteLine("--- Debug ---\n" + debug);
-                    }
 
-                    // 重置 buffer
-                    buffer.Clear();
-                    cursor = 0;
-                    continue;
-                }
-                // 普通字符 & 粘贴
-                if (!char.IsControl(key.KeyChar))
-                {
-                    buffer.Insert(cursor, key.KeyChar);
-                    cursor++;
-                    // 继续读取缓冲区里的字符（粘贴）
-                    while (Console.KeyAvailable)
-                    {
-                        var c = Console.ReadKey(intercept: true).KeyChar;
-                        if (!char.IsControl(c))
+                        textView.Text = enc;
+                        resultLabel.Text = "加密完成";
+                        resultLabel.ColorScheme = Colors.Base;
+
+                        if (!string.IsNullOrEmpty(debug))
                         {
-                            buffer.Insert(cursor, c);
-                            cursor++;
+                            MessageBox.Query("Debug信息", debug, "确定");
                         }
                     }
-                    continue;
-                }
-                // 其他键忽略
+                    catch (Exception ex)
+                    {
+                        resultLabel.Text = $"加密失败: {ex.Message}";
+                        resultLabel.ColorScheme = Colors.Error;
+                    }
+                };
+
+                // 解密按钮事件
+                decryptBtn.Clicked += () =>
+                {
+                    try
+                    {
+                        var inputText = textView.Text.ToString();
+                        if (string.IsNullOrEmpty(inputText))
+                        {
+                            resultLabel.Text = "输入内容为空";
+                            resultLabel.ColorScheme = Colors.Error;
+                            return;
+                        }
+
+                        byte[] data;
+                        string debug;
+
+                        if (usePassword)
+                        {
+                            var pwdChars = SecureStringToCharArray(securePwd);
+                            (data, debug) = DecryptText(inputText, pwdChars);
+                            Array.Clear(pwdChars, 0, pwdChars.Length);
+                        }
+                        else
+                        {
+                            (data, debug) = DecryptTextV3(inputText, recipientPrivateKey);
+                        }
+
+                        var decryptedText = Encoding.UTF8.GetString(data);
+                        textView.Text = decryptedText;
+                        resultLabel.Text = "解密完成";
+                        resultLabel.ColorScheme = Colors.Base;
+
+                        if (!string.IsNullOrEmpty(debug))
+                        {
+                            MessageBox.Query("Debug信息", debug, "确定");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        resultLabel.Text = $"解密失败: {ex.Message}";
+                        resultLabel.ColorScheme = Colors.Error;
+                    }
+                };
+
+                // 复制按钮事件
+                copyBtn.Clicked += () =>
+                {
+                    try
+                    {
+                        var content = textView.Text.ToString();
+                        if (string.IsNullOrEmpty(content))
+                        {
+                            resultLabel.Text = "没有内容可复制";
+                            resultLabel.ColorScheme = Colors.Error;
+                            return;
+                        }
+
+                        Clipboard.TrySetClipboardData(content);
+                        resultLabel.Text = "已复制到剪贴板";
+                        resultLabel.ColorScheme = Colors.Base;
+                    }
+                    catch (Exception ex)
+                    {
+                        resultLabel.Text = $"复制失败: {ex.Message}";
+                        resultLabel.ColorScheme = Colors.Error;
+                    }
+                };
+
+                clearBtn.Clicked += () => {
+                    textView.Text = "";
+                    resultLabel.Text = "已清空";
+                    resultLabel.ColorScheme = Colors.Base;
+                };
+
+                // 退出按钮事件
+                exitBtn.Clicked += () =>
+                {
+                    Application.RequestStop();
+                };
+
+                // 键盘快捷键
+                win.KeyPress += (e) =>
+                {
+                    if (e.KeyEvent.Key == Key.F1)
+                    {
+                        encryptBtn.OnClicked();
+                        e.Handled = true;
+                    }
+                    else if (e.KeyEvent.Key == Key.F2)
+                    {
+                        decryptBtn.OnClicked();
+                        e.Handled = true;
+                    }
+                    else if (e.KeyEvent.Key == Key.F3)
+                    {
+                        copyBtn.OnClicked();
+                        e.Handled = true;
+                    }
+                    else if (e.KeyEvent.Key == Key.F4)
+                    {
+                        clearBtn.OnClicked();
+                        e.Handled = true;
+                    }
+                    else if (e.KeyEvent.Key == Key.F5)
+                    {
+                        encryptCopyBtn.OnClicked();
+                        e.Handled = true;
+                    }
+                    else if (e.KeyEvent.Key == Key.F6)
+                    {
+                        pasteDecryptBtn.OnClicked();
+                        e.Handled = true;
+                    }
+#if DEBUG
+                    else if (e.KeyEvent.Key == Key.F7)
+                    {
+                        toggleDebugBtn.OnClicked();
+                        e.Handled = true;
+                    }
+#endif
+                    else if (e.KeyEvent.Key == Key.Esc)
+                    {
+                        Application.RequestStop();
+                        e.Handled = true;
+                    }
+                };
+
+                // 添加控件到窗口 - 按从左到右，从上到下的顺序添加
+                win.Add(statusLabel);
+                win.Add(textView);
+
+                // 第一行按钮按顺序添加
+                win.Add(encryptBtn);
+                win.Add(decryptBtn);
+                win.Add(copyBtn);
+                win.Add(clearBtn);
+                win.Add(exitBtn);
+
+                // 第二行按钮按顺序添加
+                win.Add(encryptCopyBtn);
+                win.Add(pasteDecryptBtn);
+#if DEBUG
+                win.Add(toggleDebugBtn);
+#endif
+
+                win.Add(resultLabel);
+
+                // 顶部菜单
+                var menu = new MenuBar(new MenuBarItem[] {
+                    new MenuBarItem ("操作", new MenuItem [] {
+                        new MenuItem ("加密", "对当前内容进行加密", () => encryptBtn.OnClicked()),
+                        new MenuItem ("解密", "对当前内容进行解密", () => decryptBtn.OnClicked()),
+                        new MenuItem ("复制", "复制内容到剪贴板", () => copyBtn.OnClicked()),
+                        new MenuItem ("清空", "清空文本内容", () => clearBtn.OnClicked()),
+                        null,
+                        new MenuItem ("加密并复制", "加密后复制到剪贴板", () => encryptCopyBtn.OnClicked()),
+                        new MenuItem ("粘贴并解密", "从剪贴板粘贴并解密", () => pasteDecryptBtn.OnClicked()),
+                        null,
+                        new MenuItem ("退出", "退出程序", () => Application.RequestStop())
+                    }),
+                    new MenuBarItem ("帮助", new MenuItem [] {
+                        new MenuItem ("快捷键", "显示快捷键说明", () => {
+                            var shortcuts = "F1: 加密\n" +
+                                           "F2: 解密\n" +
+                                           "F3: 复制到剪贴板\n" +
+                                           "F4: 清空内容\n" +
+                                           "F5: 加密并复制\n" +
+                                           "F6: 粘贴并解密\n";
+#if DEBUG
+                            shortcuts += "F7: 切换调试模式\n";
+#endif
+                            shortcuts += "ESC: 退出\n" +
+                                        "Tab: 切换控件焦点";
+                            MessageBox.Query("快捷键说明", shortcuts, "确定");
+                        }),
+                        new MenuItem ("关于", "关于此工具", () => {
+                            var aboutMsg = usePassword ?
+                                $"批量加/解密工具\n密码模式: {passwordMode}" :
+                                "批量加/解密工具\n密钥文件模式: V3";
+                            MessageBox.Query("关于", aboutMsg, "确定");
+                        })
+                    })
+                });
+
+                // 设置焦点到文本框
+                textView.SetFocus();
+
+                top.Add(menu, win);
+                Application.Run();
+            }
+            finally
+            {
+                Application.Shutdown();
+                securePwd?.Dispose();
             }
 
-            securePwd?.Dispose();
             Console.WriteLine("已退出批量加/解密模式。");
         }
 
