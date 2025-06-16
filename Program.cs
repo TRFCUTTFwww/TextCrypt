@@ -20,6 +20,7 @@ using TGPos = Terminal.Gui.Pos;
 // 如果你还用到了 Terminal.Gui.Attribute，也可以加上
 using TGAttribute = Terminal.Gui.Attribute;
 using NStack;
+using System.Reflection;
 
 namespace TextCrypt
 {
@@ -293,6 +294,11 @@ ooooooooooooo                           .     .oooooo.                          
 ");
                 Console.WriteLine(randomSlogan);
                 Console.WriteLine("便捷式离线文本加密解密工具");
+                var infoAttr = Assembly
+            .GetEntryAssembly()!
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>();
+                string semVer = infoAttr?.InformationalVersion ?? "Unknown";
+                Console.WriteLine($"内部开发版本：{semVer}");
 #if DEBUG
                 Console.WriteLine("当前版本：DEBUG，已自动启用调试模式");
                 DebugMode = true;

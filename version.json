@@ -1,0 +1,12 @@
+{
+  "version": "3.4",
+  "publicReleaseRefSpec": [
+    "^refs/heads/main$",
+    "^refs/heads/libsodium$",
+    "^refs/tags/v\\d+"
+  ],
+  "versionHeightOffset": 0,
+  "cloudBuild": {
+    "setVersionVariables": true
+  }
+}
