@@ -21,6 +21,7 @@ using TGPos = Terminal.Gui.Pos;
 using TGAttribute = Terminal.Gui.Attribute;
 using NStack;
 using System.Reflection;
+using System.Diagnostics.Metrics;
 
 namespace TextCrypt
 {
@@ -1138,53 +1139,100 @@ ooooooooooooo                           .     .oooooo.                          
         static void RegeneratePublicKeyFromPrivateKey()
         {
             Console.Clear();
-            Console.WriteLine("\n=== 通过私钥重新生成公钥 ===");
-            Console.Write("\n请输入私钥文件路径: ");
-            string privateKeyFilePath = Console.ReadLine();
+            Console.WriteLine("=== 通过私钥重新生成公钥 === ");
+        
+    // 获取当前目录下的所有私钥文件并列出
+            string[] privateKeyFiles = Directory.GetFiles(Directory.GetCurrentDirectory(), "*.pem");
 
-            if (string.IsNullOrWhiteSpace(privateKeyFilePath) || !File.Exists(privateKeyFilePath))
+            if (privateKeyFiles.Length == 0)
             {
-                Console.WriteLine("无效的私钥文件路径，操作取消。");
+                Console.WriteLine("当前目录下没有找到任何私钥文件。");
                 return;
             }
 
+            Console.WriteLine("当前目录下的私钥文件: ");
+    for (int i = 0; i < privateKeyFiles.Length; i++)
+            {
+                string sha512 = GetFileSha512(privateKeyFiles[i]);
+                Console.WriteLine($"{i + 1}. {Path.GetFileName(privateKeyFiles[i])}");
+                Console.WriteLine($"   SHA-512: {sha512}");
+            }
+
+            // 提示用户选择文件
+            Console.Write("请输入私钥文件的序号选择(或按 Enter 使用默认文件): ");
+        
+            string input = Console.ReadLine();
+
+            int selectedIndex;
+            if (string.IsNullOrWhiteSpace(input))
+            {
+                selectedIndex = 0;  // 默认第一个
+            }
+            else if (int.TryParse(input, out var idx) && idx >= 1 && idx <= privateKeyFiles.Length)
+            {
+                selectedIndex = idx - 1;
+            }
+            else
+            {
+                Console.WriteLine("无效的序号，操作取消。");
+                return;
+            }
+
+            string privateKeyFilePath = privateKeyFiles[selectedIndex];
+
             try
             {
-                // 从私钥文件读取内容
+                // 读取 PEM 私钥原文
                 string privateKeyPem = File.ReadAllText(privateKeyFilePath);
 
-                // 从 PEM 格式中提取私钥
-                string privateKeyBase64 = privateKeyPem
-                    .Replace("-----BEGIN PRIVATE KEY-----", "")
-                    .Replace("-----END PRIVATE KEY-----", "")
-                    .Replace("\n", "");
-
-                byte[] privateKeyBytes = Convert.FromBase64String(privateKeyBase64);
-
-                // 使用私钥生成公钥
-                using (var ecdh = ECDiffieHellman.Create())
+                // 使用 .NET 内置 PEM 支持直接导入私钥
+                using (var ecdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP521))
                 {
-                    ecdh.ImportPkcs8PrivateKey(privateKeyBytes, out _);
-                    byte[] publicKeyBytes = ecdh.PublicKey.ToByteArray();
+                    ecdh.ImportFromPem(privateKeyPem.ToCharArray());
 
-                    string publicKeyBase64 = Convert.ToBase64String(publicKeyBytes);
-                    string publicKeyPem =
-                        "-----BEGIN PUBLIC KEY-----\n" +
-                        string.Join("\n", publicKeyBase64.Chunk(64).Select(chunk => new string(chunk))) +
-                        "\n-----END PUBLIC KEY-----\n";
+                    // 导出标准 SPKI DER
+                    byte[] spkiDer = ecdh.ExportSubjectPublicKeyInfo();
+                    string publicKeyBase64 = Convert.ToBase64String(spkiDer);
 
-                    // 输出公钥
-                    string publicKeyFilePath = privateKeyFilePath.Replace(".private.pem", ".public.pub");
-                    File.WriteAllText(publicKeyFilePath, publicKeyPem);
-                    Console.WriteLine($"\n√ 公钥已保存到: {publicKeyFilePath}");
+                    // 构建 PEM 格式公钥，每行 64 字符
+                    var sb = new StringBuilder();
+                    sb.AppendLine("-----BEGIN PUBLIC KEY-----");
+                    for (int pos = 0; pos < publicKeyBase64.Length; pos += 64)
+                    {
+                        sb.AppendLine(publicKeyBase64.Substring(pos, Math.Min(64, publicKeyBase64.Length - pos)));
+                    }
+                    sb.AppendLine("-----END PUBLIC KEY-----");
+
+                    // 保存公钥文件，文件名与私钥同名但扩展名 .pub
+                    string publicKeyFilePath = Path.ChangeExtension(privateKeyFilePath, ".pub");
+                    if (File.Exists(publicKeyFilePath))
+                    {
+                        Console.WriteLine("警告：公钥文件已存在，将覆盖现有文件。");
+                    }
+
+                    File.WriteAllText(publicKeyFilePath, sb.ToString());
+                    Console.WriteLine($"√ 公钥已保存到: { publicKeyFilePath}");
+        
+            // 简单提示：数学等价，无需字节对比
+            Console.WriteLine("公钥已成功根据私钥重新生成，数学等价即可使用，无需 SHA-512 完全一致。");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"\n重新生成公钥失败: {ex.Message}");
+                Console.WriteLine($"重新生成公钥失败: { ex.Message}");
             }
-            //Console.WriteLine("\n按任意键返回主菜单...");
-            //Console.ReadKey();
+        }
+
+
+        // 计算文件的 SHA-512 校验和
+        static string GetFileSha512(string filePath)
+        {
+            using (var sha512 = SHA512.Create())
+            using (var fileStream = File.OpenRead(filePath))
+            {
+                byte[] hashBytes = sha512.ComputeHash(fileStream);
+                return BitConverter.ToString(hashBytes).Replace("-", "").ToLower();
+            }
         }
         static void ListPublicKeysSHA512()
         {
@@ -1623,6 +1671,7 @@ ooooooooooooo                           .     .oooooo.                          
             return password;
         }
 
+        //V3加密
         static (string encryptedText, string debugInfo) EncryptTextV3(byte[] plaintextBytes, string recipientPublicKeyBase64)
         {
             byte[] recipientPublicKeyBytes = null;
@@ -1709,7 +1758,7 @@ ooooooooooooo                           .     .oooooo.                          
             }
         }
 
-
+        //加密方法
         static (string encryptedText, string debugInfo) EncryptText(byte[] plaintextBytes, char[] password, string mode)
         {
             string encryptedText = null;
