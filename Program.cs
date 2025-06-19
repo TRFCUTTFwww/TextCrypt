@@ -83,6 +83,10 @@ namespace TextCrypt
             public int MemorySizeKB { get; set; } = 1024 * 256; // 256MB
             public int Iterations { get; set; } = 10;
             public int Parallelism { get; set; } = Environment.ProcessorCount;
+            // 新增：是否启用历史文件记录
+            public bool EnableHistory { get; set; } = true;
+            // 新增：历史文件路径列表
+            public List<string> HistoryPaths { get; set; } = new List<string>();
         }
 
         private const int RANDOM_NONCE_LENGTH = 16; // For V1 mode
@@ -317,7 +321,7 @@ ooooooooooooo                           .     .oooooo.                          
                 Console.WriteLine("4. 清除历史输出");
                 //Console.WriteLine("5. 切换调试模式");
                 
-                Console.WriteLine("5. 修改 Argon2 参数");
+                Console.WriteLine("5. 修改程序参数");
                 Console.WriteLine("6. V3密钥管理"); // 直接显示生成密钥对的功能
                 Console.WriteLine("7. 挂载模式");
                 Console.WriteLine("8. 批量处理模式");
@@ -863,62 +867,76 @@ ooooooooooooo                           .     .oooooo.                          
             {
                 Console.Clear();
                 Console.WriteLine("\n=== 选择密文文件 ===");
-                string[] foundFiles = null;
+
+                // 准备所有选项
+                var options = new List<(string Path, string Label)>();
+
+                // 1. 加入历史记录（如果启用）
+                if (CurrentConfig.EnableHistory && CurrentConfig.HistoryPaths.Any())
+                {
+                    foreach (var hist in CurrentConfig.HistoryPaths)
+                    {
+                        options.Add((hist, "[历史]"));
+                    }
+                }
+
+                // 2. 列出当前目录下的 .txt 文件
                 string currentDir = Directory.GetCurrentDirectory();
                 try
                 {
-                    foundFiles = Directory.GetFiles(currentDir, "*.txt"); // 假设密文文件为 .txt
+                    var files = Directory.GetFiles(currentDir, "*.txt");
+                    foreach (var f in files)
+                    {
+                        options.Add((f, "[目录]"));
+                    }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"警告: 无法在 '{currentDir}' 列出.txt文件: {ex.Message}");
+                    Console.WriteLine($"警告: 无法列出 '{currentDir}' 下的 .txt 文件: {ex.Message}");
                 }
 
-                int optionNumber = 1;
-                if (foundFiles != null && foundFiles.Length > 0)
+                // 3. 手动输入和返回选项
+                int manualIndex = options.Count + 1;
+                int returnIndex = options.Count + 2;
+
+                // 打印选项（完整路径）
+                for (int i = 0; i < options.Count; i++)
                 {
-                    Console.WriteLine($"\n在 '{currentDir}' 中找到的 .txt 文件:");
-                    for (int i = 0; i < foundFiles.Length; i++)
+                    Console.WriteLine($"{i + 1}. {options[i].Label} {options[i].Path}");
+                }
+                Console.WriteLine($"{manualIndex}. 手动输入文件路径");
+                Console.WriteLine($"{returnIndex}. 返回");
+                Console.Write($"请选择 (1-{returnIndex}): ");
+
+                // 处理输入
+                var input = Console.ReadLine();
+                if (int.TryParse(input, out int idx))
+                {
+                    if (idx >= 1 && idx <= options.Count)
                     {
-                        Console.WriteLine($"{optionNumber++}. {Path.GetFileName(foundFiles[i])}");
+                        // 选中了历史或目录文件
+                        var chosen = options[idx - 1].Path;
+                        if (File.Exists(chosen))
+                            return Path.GetFullPath(chosen);
+                        Console.WriteLine("所选文件不存在。按任意键重试...");
+                        Console.ReadKey(true);
                     }
-                }
-                else
-                {
-                    Console.WriteLine($"\n在 '{currentDir}' 中未找到 .txt 文件。");
-                }
-
-                Console.WriteLine($"\n{optionNumber}. 手动输入文件路径");
-                Console.WriteLine($"{optionNumber + 1}. 返回");
-                Console.Write($"请选择 (1-{optionNumber + 1}): ");
-
-                string choiceStr = Console.ReadLine();
-                if (int.TryParse(choiceStr, out int choice))
-                {
-                    if (foundFiles != null && choice > 0 && choice <= foundFiles.Length)
+                    else if (idx == manualIndex)
                     {
-                        return foundFiles[choice - 1];
-                    }
-                    else if (choice == optionNumber)
-                    {
+                        // 手动输入
                         Console.Write("\n请输入密文文件路径: ");
                         var filePath = Console.ReadLine()?.Trim('"');
-                        if (string.IsNullOrWhiteSpace(filePath))
+                        if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
                         {
-                            Console.WriteLine("路径不能为空。按任意键重试...");
-                            Console.ReadKey(true);
-                            continue;
-                        }
-                        if (!File.Exists(filePath))
-                        {
-                            Console.WriteLine("文件不存在。按任意键重试...");
+                            Console.WriteLine("路径无效或文件不存在。按任意键重试...");
                             Console.ReadKey(true);
                             continue;
                         }
                         return Path.GetFullPath(filePath);
                     }
-                    else if (choice == optionNumber + 1)
+                    else if (idx == returnIndex)
                     {
+                        // 返回上级
                         return null;
                     }
                     else
@@ -934,6 +952,7 @@ ooooooooooooo                           .     .oooooo.                          
                 }
             }
         }
+
 
         // 辅助方法：选择私钥文件
         static string SelectPrivateKeyFile()
@@ -2947,9 +2966,7 @@ ooooooooooooo                           .     .oooooo.                          
         {
             while (true)
             {
-                
-                Console.WriteLine("1. 单次解密 (输入密文或文件)");
-                //Console.WriteLine("2. 批量解密模式");
+                Console.WriteLine("1. 单次解密 (输入密文)");
                 Console.WriteLine("2. 从文件读取然后单次解密");
                 Console.WriteLine("0. 退出");
                 Console.Write("请选择 (0-2): ");
@@ -2962,22 +2979,8 @@ ooooooooooooo                           .     .oooooo.                          
                         DecryptInteractiveRouter(single);
                         break;
 
-                    case "299":
-                        DecryptBatchMode();
-                        break;
-
                     case "2":
-                        Console.Write("请输入文件路径: ");
-                        var path = Console.ReadLine()?.Trim('"');
-                        if (File.Exists(path))
-                        {
-                            var text = File.ReadAllText(path);
-                            DecryptInteractiveRouter(text);
-                        }
-                        else
-                        {
-                            Console.WriteLine("文件不存在。");
-                        }
+                        HandleFileDecrypt();
                         break;
 
                     case "0":
@@ -2987,6 +2990,69 @@ ooooooooooooo                           .     .oooooo.                          
                         Console.WriteLine("无效选项，请重试。");
                         break;
                 }
+            }
+        }
+
+        static void HandleFileDecrypt()
+        {
+            // 如果启用了历史记录并且有记录，先列出来
+            if (CurrentConfig.EnableHistory && CurrentConfig.HistoryPaths.Any())
+            {
+                Console.WriteLine("历史文件路径：");
+                for (int i = 0; i < CurrentConfig.HistoryPaths.Count; i++)
+                {
+                    Console.WriteLine($"  {i + 1}. {CurrentConfig.HistoryPaths[i]}");
+                }
+                Console.WriteLine($"  N. 手动输入新路径");
+                Console.Write("请选择（数字或 N）: ");
+                var choice = Console.ReadLine()?.Trim();
+
+                string path = null;
+                if (int.TryParse(choice, out int idx)
+                    && idx >= 1
+                    && idx <= CurrentConfig.HistoryPaths.Count)
+                {
+                    path = CurrentConfig.HistoryPaths[idx - 1];
+                }
+                else
+                {
+                    Console.Write("请输入文件路径: ");
+                    path = Console.ReadLine()?.Trim('"');
+                }
+
+                ProcessPath(path);
+            }
+            else
+            {
+                // 历史记录功能关闭或暂无记录
+                Console.Write("请输入文件路径: ");
+                var path = Console.ReadLine()?.Trim('"');
+                ProcessPath(path);
+            }
+        }
+
+        static void ProcessPath(string path)
+        {
+            if (File.Exists(path))
+            {
+                var text = File.ReadAllText(path);
+                DecryptInteractiveRouter(text);
+
+                // 如果启用了历史记录，且该路径未在列表中，则追加并保存
+                if (CurrentConfig.EnableHistory
+                    && !CurrentConfig.HistoryPaths.Contains(path))
+                {
+                    CurrentConfig.HistoryPaths.Add(path);
+                    // 可选：限制最多保留 N 条记录
+                    if (CurrentConfig.HistoryPaths.Count > 20)
+                        CurrentConfig.HistoryPaths.RemoveAt(0);
+
+                    SaveConfig();
+                }
+            }
+            else
+            {
+                Console.WriteLine("文件不存在。");
             }
         }
 
@@ -4156,13 +4222,14 @@ ooooooooooooo                           .     .oooooo.                          
         {
             while (true)
             {
-                Console.WriteLine("\n=== 修改 Argon2 参数 ===");
+                Console.WriteLine("\n=== 修改程序参数 ===");
                 Console.WriteLine($"当前参数:");
                 Console.WriteLine($"1. 内存大小 (MemorySizeKB): {CurrentConfig.MemorySizeKB} KB");
                 Console.WriteLine($"2. 迭代次数 (Iterations): {CurrentConfig.Iterations}");
                 Console.WriteLine($"3. 并行度 (Parallelism): {CurrentConfig.Parallelism}");
-                Console.WriteLine("4. 返回主菜单");
-                Console.Write("请选择要修改的参数 (1-4): ");
+                Console.WriteLine($"4. 历史记录功能 (EnableHistory): {(CurrentConfig.EnableHistory ? "已启用" : "已禁用")}");
+                Console.WriteLine("5. 返回主菜单");
+                Console.Write("请选择要修改的参数 (1-5): ");
 
                 var choice = Console.ReadLine();
 
@@ -4211,6 +4278,18 @@ ooooooooooooo                           .     .oooooo.                          
                         break;
 
                     case "4":
+                        // 切换历史记录开关
+                        CurrentConfig.EnableHistory = !CurrentConfig.EnableHistory;
+                        if (!CurrentConfig.EnableHistory)
+                        {
+                            // 用户选择禁用时，清空历史列表
+                            CurrentConfig.HistoryPaths.Clear();
+                        }
+                        SaveConfig();
+                        Console.WriteLine($"历史记录功能已{(CurrentConfig.EnableHistory ? "启用" : "禁用")}。");
+                        break;
+
+                    case "5":
                         Console.WriteLine("返回主菜单。");
                         return;
 
