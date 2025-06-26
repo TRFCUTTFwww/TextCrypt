@@ -67,7 +67,7 @@ namespace TextCrypt
         }
 
         public enum PanelMode { Encrypt, Decrypt }
-
+        private static List<(string EncryptedText, string FilePath, string TempFilePath, byte[] DecryptedBytes, string OriginalMode, char[] OriginalPassword, string PrivateKeyBase64, bool IsV3Mode, string DebugInfo)> mountedCiphertexts = new List<(string EncryptedText, string FilePath, string TempFilePath, byte[] DecryptedBytes, string OriginalMode, char[] OriginalPassword, string PrivateKeyBase64, bool IsV3Mode, string DebugInfo)>();
 
         public class PanelState
         {
@@ -395,24 +395,36 @@ ooooooooooooo                           .     .oooooo.                          
                 }
             }
         }
+        // 静态变量：存储挂载的密文信息，在程序运行期间保持状态
+        //private static List<(string EncryptedText, string FilePath, string TempFilePath, byte[] DecryptedBytes, string OriginalMode, char[] OriginalPassword, string PrivateKeyBase64, bool IsV3Mode, string DebugInfo)> mountedCiphertexts = new List<(string EncryptedText, string FilePath, string TempFilePath, byte[] DecryptedBytes, string OriginalMode, char[] OriginalPassword, string PrivateKeyBase64, bool IsV3Mode, string DebugInfo)>();
+
         static void mount()
         {
             Console.WriteLine("=== 挂载模式 ===");
 
-            // 存储挂载的密文信息
-            var mountedCiphertexts = new List<(string EncryptedText, string FilePath, string TempFilePath, byte[] DecryptedBytes, string OriginalMode, char[] OriginalPassword, string PrivateKeyBase64, bool IsV3Mode, string DebugInfo)>();
+            // 显示当前挂载状态
+            if (mountedCiphertexts.Any())
+            {
+                Console.WriteLine($"当前已挂载 {mountedCiphertexts.Count} 个密文");
+            }
 
             while (true)
             {
+                // 显示挂载模式菜单
                 Console.WriteLine("\n1. 挂载新密文");
                 Console.WriteLine("2. 查看已挂载密文列表");
-                Console.WriteLine("3. 返回主菜单");
-                Console.Write("请输入选择 (或输入 'exit' 放弃所有挂载): ");
+                Console.WriteLine("3. 清理临时文件");
+                Console.WriteLine("4. 返回主菜单 (保留挂载)");
+                Console.WriteLine("5. 退出并清理所有数据");
+                Console.Write("请输入选择 (或输入 'exit' 退出并清理): ");
                 var choice = Console.ReadLine()?.Trim().ToLower();
 
-                if (choice == "exit")
+                if (choice == "exit" || choice == "5")
                 {
                     // 清理所有临时文件和敏感数据
+                    Console.WriteLine("\n正在清理所有挂载数据和临时文件...");
+
+                    // 清理挂载列表中的临时文件
                     foreach (var item in mountedCiphertexts)
                     {
                         if (File.Exists(item.TempFilePath))
@@ -430,15 +442,28 @@ ooooooooooooo                           .     .oooooo.                          
                         if (item.DecryptedBytes != null) Array.Clear(item.DecryptedBytes, 0, item.DecryptedBytes.Length);
                         if (item.OriginalPassword != null) Array.Clear(item.OriginalPassword, 0, item.OriginalPassword.Length);
                     }
+
+                    // 清理临时目录中所有由本程序创建的文件
+                    CleanupAllProgramTempFiles();
+
                     mountedCiphertexts.Clear();
-                    Console.WriteLine("所有挂载已放弃。");
+                    Console.WriteLine("所有挂载已放弃，所有临时文件已清理。");
+                    return;
+                }
+
+                if (choice == "4")
+                {
+                    // 保留挂载状态，返回主菜单
+                    Console.WriteLine($"\n当前有 {mountedCiphertexts.Count} 个密文保持挂载状态。");
+                    Console.WriteLine("返回主菜单后，可以再次进入挂载模式继续操作。");
                     return;
                 }
 
                 if (choice == "3")
                 {
-                    // 保留挂载状态，返回主菜单
-                    return;
+                    // 清理临时文件
+                    ManageTempFiles();
+                    continue;
                 }
 
                 if (choice == "1")
@@ -517,7 +542,6 @@ ooooooooooooo                           .     .oooooo.                          
                                 continue;
                             }
                             Console.WriteLine("\n正在使用 V3 私钥解密，请稍候...");
-                            // Assuming DecryptTextV3 exists and returns (byte[], string)
                             (decryptedBytes, debugInfo) = DecryptTextV3(encryptedText, privateKeyBase64);
                             originalMode = "V3";
                         }
@@ -533,18 +557,15 @@ ooooooooooooo                           .     .oooooo.                          
                                     continue;
                                 }
                                 Console.WriteLine("\n正在解密，这可能需要一些时间，请稍候...");
-                                // Assuming DecryptText exists and returns (byte[], string)
                                 (decryptedBytes, debugInfo) = DecryptText(encryptedText, originalPassword);
 
                                 // 尝试解析加密模式
                                 try
                                 {
                                     string passwordStr = new string(originalPassword);
-                                    // Assuming these methods exist and are accessible
                                     var (shuffledCharset, charToValueMap, customBase) = GeneratePasswordDerivedCharset(passwordStr);
                                     byte[] decodedBytes = PasswordDerivedBaseStringToBytes(encryptedText, shuffledCharset, charToValueMap, customBase);
                                     string jsonString = Encoding.UTF8.GetString(decodedBytes);
-                                    // Assuming EnvelopeData class exists and JsonSerializer is available
                                     var envelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
                                     originalMode = envelope?.V ?? "V2";
                                     if (originalMode == "2") originalMode = "V2";
@@ -570,7 +591,7 @@ ooooooooooooo                           .     .oooooo.                          
                             }
                         }
 
-                        if (DebugMode) // Assuming DebugMode is a static boolean field
+                        if (DebugMode)
                         {
                             Console.WriteLine("\n调试信息 (解密参数):");
                             Console.WriteLine(debugInfo);
@@ -623,7 +644,7 @@ ooooooooooooo                           .     .oooooo.                          
                         }
 
                         // 更新解密后的明文
-                        byte[] editedPlaintextBytesAtMount = File.ReadAllBytes(tempFilePath); // Changed variable name
+                        byte[] editedPlaintextBytesAtMount = File.ReadAllBytes(tempFilePath);
                         if (decryptedBytes != null) Array.Clear(decryptedBytes, 0, decryptedBytes.Length);
                         // 添加到挂载列表
                         mountedCiphertexts.Add((encryptedText, selectedFile, tempFilePath, editedPlaintextBytesAtMount, originalMode, originalPassword, privateKeyBase64, isV3Mode, debugInfo));
@@ -680,7 +701,6 @@ ooooooooooooo                           .     .oooooo.                          
                     Console.Write("请输入选择: ");
                     var actionChoice = Console.ReadLine();
 
-                    // Declare editedPlaintextBytesA outside the switch to avoid redefinition issues
                     byte[] editedPlaintextBytesA = null;
 
                     switch (actionChoice)
@@ -736,7 +756,7 @@ ooooooooooooo                           .     .oooooo.                          
 
                             string newEncryptedText = null;
                             string newDebugInfo = null;
-                            string mode = selectedCiphertext.OriginalMode; // 默认使用原模式
+                            string mode = selectedCiphertext.OriginalMode;
 
                             if (!resetEncryption)
                             {
@@ -746,7 +766,6 @@ ooooooooooooo                           .     .oooooo.                          
                                     if (selectedCiphertext.IsV3Mode && !string.IsNullOrEmpty(selectedCiphertext.PrivateKeyBase64))
                                     {
                                         Console.WriteLine("\n正在使用原公钥重新加密，请稍候...");
-                                        // Assuming EncryptTextV3 exists and returns (string, string)
                                         (newEncryptedText, newDebugInfo) = EncryptTextV3(editedPlaintextBytesA, selectedCiphertext.PrivateKeyBase64);
                                     }
                                     else if (selectedCiphertext.OriginalPassword != null && !string.IsNullOrEmpty(selectedCiphertext.OriginalMode))
@@ -760,14 +779,12 @@ ooooooooooooo                           .     .oooooo.                          
                                         {
                                             throw new Exception("原密码为空，无法加密。");
                                         }
-                                        // Assuming EncryptText exists and returns (string, string)
                                         (newEncryptedText, newDebugInfo) = EncryptText(editedPlaintextBytesA, selectedCiphertext.OriginalPassword, selectedCiphertext.OriginalMode);
                                         if (string.IsNullOrEmpty(newEncryptedText))
                                         {
                                             throw new Exception("加密结果为空，重新加密失败。");
                                         }
                                         // 验证加密结果
-                                        // Assuming DecryptText exists and returns (byte[], string)
                                         var (testDecryptedBytes, testDebugInfo) = DecryptText(newEncryptedText, selectedCiphertext.OriginalPassword);
                                         if (testDecryptedBytes == null || !testDecryptedBytes.SequenceEqual(editedPlaintextBytesA))
                                         {
@@ -821,7 +838,6 @@ ooooooooooooo                           .     .oooooo.                          
                                 {
                                     if (mode == "V3")
                                     {
-                                        // Assuming SelectPublicKeyFile exists and returns string
                                         string publicKeyBase64 = SelectPublicKeyFile();
                                         if (string.IsNullOrEmpty(publicKeyBase64))
                                         {
@@ -829,13 +845,11 @@ ooooooooooooo                           .     .oooooo.                          
                                             continue;
                                         }
                                         Console.WriteLine("\n正在使用 V3 非对称加密，请稍候...");
-                                        // Assuming EncryptTextV3 exists and returns (string, string)
                                         (newEncryptedText, newDebugInfo) = EncryptTextV3(editedPlaintextBytesA, publicKeyBase64);
                                     }
                                     else
                                     {
                                         Console.Write("\n请输入新密码: ");
-                                        // Assuming ReadPassword exists and returns char[]
                                         char[] newPassword = ReadPassword();
                                         try
                                         {
@@ -854,7 +868,6 @@ ooooooooooooo                           .     .oooooo.                          
                                                     continue;
                                                 }
                                                 Console.WriteLine("\n正在加密，请稍候...");
-                                                // Assuming EncryptText exists and returns (string, string)
                                                 (newEncryptedText, newDebugInfo) = EncryptText(editedPlaintextBytesA, newPassword, mode);
                                                 // 更新原密码
                                                 if (selectedCiphertext.OriginalPassword != null) Array.Clear(selectedCiphertext.OriginalPassword, 0, selectedCiphertext.OriginalPassword.Length);
@@ -951,13 +964,7 @@ ooooooooooooo                           .     .oooooo.                          
                                     break;
                             }
 
-                            // 更新密文 (此处逻辑已经更新了 mountedCiphertexts[index - 1]，不再需要重复更新 DecryptedBytes)
-                            // Note: The previous logic had a potential issue with `mountedCiphertexts[index - 1].OriginalPassword` being cleared too early
-                            // The tuple assignment inside the resetEncryption block already handles the update.
-                            // If you need to clear the old decryptedBytes, do it before assigning new ones.
                             if (selectedCiphertext.DecryptedBytes != null) Array.Clear(selectedCiphertext.DecryptedBytes, 0, selectedCiphertext.DecryptedBytes.Length);
-                            // The line below ensures the updated `newEncryptedText` is stored in the tuple.
-                            // The `editedPlaintextBytesA` passed to the tuple here is the *last read* plaintext, which is correct.
                             mountedCiphertexts[index - 1] = (newEncryptedText, selectedCiphertext.FilePath, selectedCiphertext.TempFilePath, editedPlaintextBytesA, mode, mountedCiphertexts[index - 1].OriginalPassword, selectedCiphertext.PrivateKeyBase64, selectedCiphertext.IsV3Mode, newDebugInfo);
                             break;
 
@@ -991,6 +998,278 @@ ooooooooooooo                           .     .oooooo.                          
                     Console.WriteLine("无效选择，请重试。");
                 }
             }
+        }
+
+        // 新增：临时文件管理功能
+        static void ManageTempFiles()
+        {
+            Console.WriteLine("\n=== 临时文件管理 ===");
+
+            try
+            {
+                // 获取临时目录
+                string tempDir = Path.GetTempPath();
+
+                // 查找所有由程序创建的临时文件
+                var programTempFiles = Directory.GetFiles(tempDir, "textcrypt_mount_decrypted_*.txt")
+                                                .OrderBy(f => File.GetCreationTime(f))
+                                                .ToList();
+
+                if (!programTempFiles.Any())
+                {
+                    Console.WriteLine("没有找到由程序创建的临时文件。");
+                    return;
+                }
+
+                Console.WriteLine($"\n找到 {programTempFiles.Count} 个由程序创建的临时文件:");
+
+                // 分类显示：挂载中的和未挂载的
+                var mountedTempFiles = mountedCiphertexts.Select(m => m.TempFilePath).ToHashSet();
+                var activeTempFiles = new List<string>();
+                var orphanedTempFiles = new List<string>();
+
+                foreach (var file in programTempFiles)
+                {
+                    if (mountedTempFiles.Contains(file))
+                    {
+                        activeTempFiles.Add(file);
+                    }
+                    else
+                    {
+                        orphanedTempFiles.Add(file);
+                    }
+                }
+
+                // 显示文件列表
+                Console.WriteLine("\n【挂载中的临时文件】:");
+                if (activeTempFiles.Any())
+                {
+                    for (int i = 0; i < activeTempFiles.Count; i++)
+                    {
+                        var file = activeTempFiles[i];
+                        var fileInfo = new FileInfo(file);
+                        Console.WriteLine($"  {i + 1}. {Path.GetFileName(file)} (大小: {fileInfo.Length} 字节, 修改时间: {fileInfo.LastWriteTime:yyyy-MM-dd HH:mm:ss})");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("  无");
+                }
+
+                Console.WriteLine("\n【孤立的临时文件】:");
+                if (orphanedTempFiles.Any())
+                {
+                    for (int i = 0; i < orphanedTempFiles.Count; i++)
+                    {
+                        var file = orphanedTempFiles[i];
+                        var fileInfo = new FileInfo(file);
+                        Console.WriteLine($"  {i + 1}. {Path.GetFileName(file)} (大小: {fileInfo.Length} 字节, 修改时间: {fileInfo.LastWriteTime:yyyy-MM-dd HH:mm:ss})");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("  无");
+                }
+
+                if (!orphanedTempFiles.Any())
+                {
+                    Console.WriteLine("\n所有临时文件都在正常使用中，无需清理。");
+                    return;
+                }
+
+                Console.WriteLine("\n清理选项:");
+                Console.WriteLine("1. 清理所有孤立的临时文件");
+                Console.WriteLine("2. 选择性清理孤立的临时文件");
+                Console.WriteLine("3. 返回");
+                Console.Write("请输入选择: ");
+                var choice = Console.ReadLine()?.Trim();
+
+                switch (choice)
+                {
+                    case "1":
+                        // 清理所有孤立文件
+                        Console.Write($"\n确定要删除所有 {orphanedTempFiles.Count} 个孤立的临时文件吗？(y/n): ");
+                        if (Console.ReadLine()?.ToLower() == "y")
+                        {
+                            int deletedCount = 0;
+                            foreach (var file in orphanedTempFiles)
+                            {
+                                try
+                                {
+                                    File.Delete(file);
+                                    deletedCount++;
+                                    Console.WriteLine($"已删除: {Path.GetFileName(file)}");
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine($"删除失败 {Path.GetFileName(file)}: {ex.Message}");
+                                }
+                            }
+                            Console.WriteLine($"\n清理完成，成功删除 {deletedCount} 个文件。");
+                        }
+                        break;
+
+                    case "2":
+                        // 选择性清理
+                        Console.WriteLine("\n请选择要删除的文件 (输入序号，多个序号用空格分隔，或输入 'all' 删除全部):");
+                        for (int i = 0; i < orphanedTempFiles.Count; i++)
+                        {
+                            var file = orphanedTempFiles[i];
+                            var fileInfo = new FileInfo(file);
+                            Console.WriteLine($"  {i + 1}. {Path.GetFileName(file)} (大小: {fileInfo.Length} 字节, 修改时间: {fileInfo.LastWriteTime:yyyy-MM-dd HH:mm:ss})");
+                        }
+
+                        Console.Write("\n请输入选择: ");
+                        var selection = Console.ReadLine()?.Trim();
+
+                        if (string.IsNullOrEmpty(selection))
+                        {
+                            Console.WriteLine("未选择任何文件。");
+                            break;
+                        }
+
+                        List<int> selectedIndices = new List<int>();
+
+                        if (selection.ToLower() == "all")
+                        {
+                            selectedIndices.AddRange(Enumerable.Range(0, orphanedTempFiles.Count));
+                        }
+                        else
+                        {
+                            var parts = selection.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                            foreach (var part in parts)
+                            {
+                                if (int.TryParse(part, out int index) && index >= 1 && index <= orphanedTempFiles.Count)
+                                {
+                                    selectedIndices.Add(index - 1);
+                                }
+                                else
+                                {
+                                    Console.WriteLine($"无效序号: {part}");
+                                }
+                            }
+                        }
+
+                        if (selectedIndices.Any())
+                        {
+                            Console.Write($"\n确定要删除选中的 {selectedIndices.Count} 个文件吗？(y/n): ");
+                            if (Console.ReadLine()?.ToLower() == "y")
+                            {
+                                int deletedCount = 0;
+                                foreach (var index in selectedIndices.Distinct().OrderByDescending(x => x))
+                                {
+                                    var file = orphanedTempFiles[index];
+                                    try
+                                    {
+                                        File.Delete(file);
+                                        deletedCount++;
+                                        Console.WriteLine($"已删除: {Path.GetFileName(file)}");
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Console.WriteLine($"删除失败 {Path.GetFileName(file)}: {ex.Message}");
+                                    }
+                                }
+                                Console.WriteLine($"\n清理完成，成功删除 {deletedCount} 个文件。");
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine("没有选择有效的文件。");
+                        }
+                        break;
+
+                    case "3":
+                        return;
+
+                    default:
+                        Console.WriteLine("无效选择。");
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"管理临时文件时发生错误: {ex.Message}");
+            }
+        }
+
+        // 新增：清理所有程序创建的临时文件（用于退出时）
+        static void CleanupAllProgramTempFiles()
+        {
+            try
+            {
+                string tempDir = Path.GetTempPath();
+                var programTempFiles = Directory.GetFiles(tempDir, "textcrypt_mount_decrypted_*.txt");
+
+                int deletedCount = 0;
+                foreach (var file in programTempFiles)
+                {
+                    try
+                    {
+                        File.Delete(file);
+                        deletedCount++;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"警告: 删除临时文件 {Path.GetFileName(file)} 失败: {ex.Message}");
+                    }
+                }
+
+                if (deletedCount > 0)
+                {
+                    Console.WriteLine($"已清理 {deletedCount} 个程序临时文件。");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"清理程序临时文件时发生错误: {ex.Message}");
+            }
+        }
+
+        // 新增：获取当前挂载状态信息
+        static void ShowMountStatus()
+        {
+            if (mountedCiphertexts.Any())
+            {
+                Console.WriteLine($"当前有 {mountedCiphertexts.Count} 个密文保持挂载状态。");
+            }
+            else
+            {
+                Console.WriteLine("当前没有挂载的密文。");
+            }
+        }
+
+        // 新增：程序退出时清理所有挂载数据（供主程序调用）
+        static void CleanupAllMountData()
+        {
+            if (mountedCiphertexts.Any())
+            {
+                Console.WriteLine("\n正在清理所有挂载数据...");
+
+                foreach (var item in mountedCiphertexts)
+                {
+                    if (File.Exists(item.TempFilePath))
+                    {
+                        try
+                        {
+                            File.Delete(item.TempFilePath);
+                            Console.WriteLine($"临时文件 {item.TempFilePath} 已删除。");
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"警告: 删除临时文件 {item.TempFilePath} 失败: {ex.Message}");
+                        }
+                    }
+                    if (item.DecryptedBytes != null) Array.Clear(item.DecryptedBytes, 0, item.DecryptedBytes.Length);
+                    if (item.OriginalPassword != null) Array.Clear(item.OriginalPassword, 0, item.OriginalPassword.Length);
+                }
+
+                mountedCiphertexts.Clear();
+                Console.WriteLine("所有挂载数据已清理。");
+            }
+
+            // 清理所有程序临时文件
+            CleanupAllProgramTempFiles();
         }
 
 
