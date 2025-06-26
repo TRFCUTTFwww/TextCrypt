@@ -45,11 +45,25 @@ namespace TextCrypt
             public string K { get; set; } // Encrypted DEK (for V1)
             public string I { get; set; } // IV / Nonce
             public string C { get; set; } // Ciphertext
+            public string Sig { get; set; } // 签名
             public string T { get; set; } // GCM Tag (for V1, V2, V3)
             public string EK { get; set; } // Ephemeral Public Key (for V3)
             public int AM { get; set; } // Argon2 Memory (for V1, V2)
             public int AI { get; set; } // Argon2 Iterations (for V1, V2)
             public int AP { get; set; } // Argon2 Parallelism (for V1, V2)
+
+            public static EnvelopeData ParseHeader(string encryptedText, string recipientPublicKeyBase64)
+            {
+                // 调用你们已有的 GeneratePasswordDerivedCharset & PasswordDerivedBaseStringToBytes
+                var (shuffledCharset, charToValueMap, customBase) =
+                    Program.GeneratePasswordDerivedCharset(recipientPublicKeyBase64);
+
+                byte[] jsonBytes = Program.PasswordDerivedBaseStringToBytes(
+                    encryptedText, shuffledCharset, charToValueMap, customBase);
+
+                string json = Encoding.UTF8.GetString(jsonBytes);
+                return JsonSerializer.Deserialize<EnvelopeData>(json);
+            }
         }
 
         public enum PanelMode { Encrypt, Decrypt }
@@ -181,6 +195,7 @@ namespace TextCrypt
 
             // customBase 即字符集长度
             return (shuffledCharset, charToValueMap, n);
+            
         }
 
         // Encode bytes to custom base string
@@ -254,8 +269,10 @@ namespace TextCrypt
                 Buffer.BlockCopy(numericBytes, 0, finalResult, leadingZeroChars, numericBytes.Length);
             }
             return finalResult;
+            
         }
 
+        
         static void Main(string[] args)
         {
             if (args.Length == 0)
@@ -306,7 +323,7 @@ ooooooooooooo                           .     .oooooo.                          
                 Console.WriteLine($"内部开发版本：{semVer}");
 #if DEBUG
                 Console.WriteLine("当前版本：DEBUG，已自动启用调试模式");
-                DebugMode = true;
+                //DebugMode = true;
                 Console.ForegroundColor = ConsoleColor.Red;
                 Console.WriteLine("!!!严禁在生产环境中使用调试版本!!!");
                 Console.ResetColor();
@@ -350,34 +367,12 @@ ooooooooooooo                           .     .oooooo.                          
 #if DEBUG
 
 #else
-                    Console.WriteLine("Release版本禁止开启调试模式！");
-                    break;
+                    Console.WriteLine("Release版本的Debug " + !DebugMode);
+                        DebugMode = !DebugMode;
+                        break;
 #endif
 
-                        Console.WriteLine("是否要切换调试模式？输入 'y' 确认，输入其他键取消：");
-                        string confirm = Console.ReadLine()?.ToLower();
-                        if (confirm == "y")
-                        {
-                            DebugMode = !DebugMode;
-                            if (DebugMode)
-                            {
-                                Console.BackgroundColor = ConsoleColor.Red;
-                                Console.Clear();
-                                Console.WriteLine("调试模式已开启");
-                                Console.WriteLine("警告：调试模式已开启，将输出主密钥、salt等敏感信息，请确保安全环境！");
-                            }
-                            else
-                            {
-                                Console.BackgroundColor = ConsoleColor.Black;
-                                Console.Clear();
-                                Console.WriteLine("调试模式已关闭");
-                            }
-                            Console.ResetColor();
-                        }
-                        else
-                        {
-                            Console.WriteLine("取消切换调试模式。");
-                        }
+                        DebugMode = !DebugMode;
                         break;
                     case "9":
                         Console.WriteLine("感谢使用，再见！");
@@ -403,149 +398,194 @@ ooooooooooooo                           .     .oooooo.                          
         static void mount()
         {
             Console.WriteLine("=== 挂载模式 ===");
-            Console.WriteLine("1. 输入密文");
-            Console.WriteLine("2. 选择密文文件");
-            Console.WriteLine("3. 返回");
-            Console.Write("\n请输入选择:");
-            var choice = Console.ReadLine();
-            string encryptedText = null;
-            string selectedFile = null;
 
-            switch (choice)
+            // 存储挂载的密文信息
+            var mountedCiphertexts = new List<(string EncryptedText, string FilePath, string TempFilePath, byte[] DecryptedBytes, string OriginalMode, char[] OriginalPassword, string PrivateKeyBase64, bool IsV3Mode, string DebugInfo)>();
+
+            while (true)
             {
-                case "1":
-                    Console.WriteLine("\n请输入密文:");
-                    encryptedText = Console.ReadLine();
-                    if (string.IsNullOrWhiteSpace(encryptedText))
-                    {
-                        Console.WriteLine("密文不能为空，操作取消。");
-                        return;
-                    }
-                    break;
+                Console.WriteLine("\n1. 挂载新密文");
+                Console.WriteLine("2. 查看已挂载密文列表");
+                Console.WriteLine("3. 返回主菜单");
+                Console.Write("请输入选择 (或输入 'exit' 放弃所有挂载): ");
+                var choice = Console.ReadLine()?.Trim().ToLower();
 
-                case "2":
-                    selectedFile = ChooseEncryptedFile();
-                    if (string.IsNullOrEmpty(selectedFile))
-                    {
-                        return; // 用户选择返回
-                    }
-                    try
-                    {
-                        encryptedText = File.ReadAllText(selectedFile);
-                        Console.WriteLine($"\n已从文件 {selectedFile} 读取密文。");
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"读取文件失败: {ex.Message}");
-                        return;
-                    }
-                    break;
-
-                case "3":
-                    return;
-
-                default:
-                    Console.WriteLine("无效选择，操作取消。");
-                    return;
-            }
-
-            // 解密流程
-            byte[] decryptedBytes = null;
-            string debugInfo = null;
-            bool isV3Mode = false;
-            string privateKeyBase64 = null;
-            char[] originalPassword = null;
-            string originalMode = null;
-
-            try
-            {
-                Console.WriteLine("\n请选择解密方式:");
-                Console.WriteLine("1. 使用密码 (适用于 V0, V0.5, V1, V2 模式)");
-                Console.WriteLine("2. 使用私钥文件 (适用于 V3 模式)");
-                Console.Write("请输入选择 (1/2, 默认 1): ");
-                var decryptChoice = Console.ReadLine();
-
-                if (decryptChoice == "2")
+                if (choice == "exit")
                 {
-                    isV3Mode = true;
-                    privateKeyBase64 = SelectPrivateKeyFile();
-                    if (string.IsNullOrEmpty(privateKeyBase64))
+                    // 清理所有临时文件和敏感数据
+                    foreach (var item in mountedCiphertexts)
                     {
-                        Console.WriteLine("未选择有效的私钥文件，操作取消。");
-                        return;
-                    }
-                    Console.WriteLine("\n正在使用 V3 私钥解密，请稍候...");
-                    (decryptedBytes, debugInfo) = DecryptTextV3(encryptedText, privateKeyBase64);
-                    originalMode = "V3";
-                }
-                else
-                {
-                    Console.Write("\n请输入密码: ");
-                    originalPassword = ReadPassword();
-                    try
-                    {
-                        if (originalPassword == null || originalPassword.Length == 0)
+                        if (File.Exists(item.TempFilePath))
                         {
-                            Console.WriteLine("\n密码不能为空，操作已取消。");
-                            return;
-                        }
-                        Console.WriteLine("\n正在解密，这可能需要一些时间，请稍候...");
-                        (decryptedBytes, debugInfo) = DecryptText(encryptedText, originalPassword);
-                        // 尝试解析加密模式
-                        try
-                        {
-                            string passwordStr = new string(originalPassword);
-                            var (shuffledCharset, charToValueMap, customBase) = GeneratePasswordDerivedCharset(passwordStr);
-                            byte[] decodedBytes = PasswordDerivedBaseStringToBytes(encryptedText, shuffledCharset, charToValueMap, customBase);
-                            string jsonString = Encoding.UTF8.GetString(decodedBytes);
-                            var envelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
-                            originalMode = envelope?.V ?? "V2";
-                            // 规范化模式标识
-                            if (originalMode == "2") originalMode = "V2";
-                            else if (originalMode == "1") originalMode = "V1";
-                            else if (originalMode == "0.5") originalMode = "V0.5";
-                            else if (originalMode == "0") originalMode = "V0";
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"警告: 无法解析加密模式，将使用默认模式 V2: {ex.Message}");
-                            originalMode = "V2";
-                            Console.Write("请确认原加密模式 (V0, V0.5, V1, V2, 默认 V2): ");
-                            var userMode = Console.ReadLine()?.Trim().ToUpper();
-                            if (!string.IsNullOrEmpty(userMode) && new[] { "V0", "V0.5", "V1", "V2" }.Contains(userMode))
+                            try
                             {
-                                originalMode = userMode;
+                                File.Delete(item.TempFilePath);
+                                Console.WriteLine($"临时文件 {item.TempFilePath} 已删除。");
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"警告: 删除临时文件 {item.TempFilePath} 失败: {ex.Message}");
                             }
                         }
+                        if (item.DecryptedBytes != null) Array.Clear(item.DecryptedBytes, 0, item.DecryptedBytes.Length);
+                        if (item.OriginalPassword != null) Array.Clear(item.OriginalPassword, 0, item.OriginalPassword.Length);
                     }
-                    finally
-                    {
-                        // 延迟清空 originalPassword，直到重新加密时使用
-                    }
+                    mountedCiphertexts.Clear();
+                    Console.WriteLine("所有挂载已放弃。");
+                    return;
                 }
 
-                if (DebugMode)
+                if (choice == "3")
                 {
-                    Console.WriteLine("\n调试信息 (解密参数):");
-                    Console.WriteLine(debugInfo);
-                    Console.WriteLine($"检测到的加密模式: {originalMode}");
+                    // 保留挂载状态，返回主菜单
+                    return;
                 }
 
-                // 解密成功，创建临时文件并打开编辑器
-                string tempFileName = "textcrypt_mount_decrypted_" + Guid.NewGuid().ToString("N") + ".txt";
-                string tempFilePath = Path.Combine(Path.GetTempPath(), tempFileName);
-                bool editingConfirmed = false;
-
-                try
+                if (choice == "1")
                 {
-                    File.WriteAllBytes(tempFilePath, decryptedBytes);
-                    Console.WriteLine($"\n√ 解密成功，明文已保存到临时文件: {tempFilePath}");
+                    // 挂载新密文
+                    Console.WriteLine("\n1. 输入密文");
+                    Console.WriteLine("2. 选择密文文件");
+                    Console.WriteLine("3. 返回");
+                    Console.Write("请输入选择: ");
+                    var inputChoice = Console.ReadLine();
 
-                    while (!editingConfirmed)
+                    string encryptedText = null;
+                    string selectedFile = null;
+
+                    switch (inputChoice)
                     {
+                        case "1":
+                            Console.WriteLine("\n请输入密文:");
+                            encryptedText = Console.ReadLine();
+                            if (string.IsNullOrWhiteSpace(encryptedText))
+                            {
+                                Console.WriteLine("密文不能为空，操作取消。");
+                                continue;
+                            }
+                            break;
+
+                        case "2":
+                            selectedFile = ChooseEncryptedFile();
+                            if (string.IsNullOrEmpty(selectedFile))
+                            {
+                                continue;
+                            }
+                            try
+                            {
+                                encryptedText = File.ReadAllText(selectedFile);
+                                Console.WriteLine($"\n已从文件 {selectedFile} 读取密文。");
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"读取文件失败: {ex.Message}");
+                                continue;
+                            }
+                            break;
+
+                        case "3":
+                            continue;
+
+                        default:
+                            Console.WriteLine("无效选择，操作取消。");
+                            continue;
+                    }
+
+                    // 解密流程
+                    byte[] decryptedBytes = null;
+                    string debugInfo = null;
+                    bool isV3Mode = false;
+                    string privateKeyBase64 = null;
+                    char[] originalPassword = null;
+                    string originalMode = null;
+
+                    try
+                    {
+                        Console.WriteLine("\n请选择解密方式:");
+                        Console.WriteLine("1. 使用密码 (适用于 V0, V0.5, V1, V2 模式)");
+                        Console.WriteLine("2. 使用私钥文件 (适用于 V3 模式)");
+                        Console.Write("请输入选择 (1/2, 默认 1): ");
+                        var decryptChoice = Console.ReadLine();
+
+                        if (decryptChoice == "2")
+                        {
+                            isV3Mode = true;
+                            privateKeyBase64 = SelectPrivateKeyFile();
+                            if (string.IsNullOrEmpty(privateKeyBase64))
+                            {
+                                Console.WriteLine("未选择有效的私钥文件，操作取消。");
+                                continue;
+                            }
+                            Console.WriteLine("\n正在使用 V3 私钥解密，请稍候...");
+                            // Assuming DecryptTextV3 exists and returns (byte[], string)
+                            (decryptedBytes, debugInfo) = DecryptTextV3(encryptedText, privateKeyBase64);
+                            originalMode = "V3";
+                        }
+                        else
+                        {
+                            Console.Write("\n请输入密码: ");
+                            originalPassword = ReadPassword();
+                            try
+                            {
+                                if (originalPassword == null || originalPassword.Length == 0)
+                                {
+                                    Console.WriteLine("\n密码不能为空，操作已取消。");
+                                    continue;
+                                }
+                                Console.WriteLine("\n正在解密，这可能需要一些时间，请稍候...");
+                                // Assuming DecryptText exists and returns (byte[], string)
+                                (decryptedBytes, debugInfo) = DecryptText(encryptedText, originalPassword);
+
+                                // 尝试解析加密模式
+                                try
+                                {
+                                    string passwordStr = new string(originalPassword);
+                                    // Assuming these methods exist and are accessible
+                                    var (shuffledCharset, charToValueMap, customBase) = GeneratePasswordDerivedCharset(passwordStr);
+                                    byte[] decodedBytes = PasswordDerivedBaseStringToBytes(encryptedText, shuffledCharset, charToValueMap, customBase);
+                                    string jsonString = Encoding.UTF8.GetString(decodedBytes);
+                                    // Assuming EnvelopeData class exists and JsonSerializer is available
+                                    var envelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+                                    originalMode = envelope?.V ?? "V2";
+                                    if (originalMode == "2") originalMode = "V2";
+                                    else if (originalMode == "1") originalMode = "V1";
+                                    else if (originalMode == "0.5") originalMode = "V0.5";
+                                    else if (originalMode == "0") originalMode = "V0";
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine($"警告: 无法解析加密模式，将使用默认模式 V2: {ex.Message}");
+                                    originalMode = "V2";
+                                    Console.Write("请确认原加密模式 (V0, V0.5, V1, V2, 默认 V2): ");
+                                    var userMode = Console.ReadLine()?.Trim().ToUpper();
+                                    if (!string.IsNullOrEmpty(userMode) && new[] { "V0", "V0.5", "V1", "V2" }.Contains(userMode))
+                                    {
+                                        originalMode = userMode;
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                // 延迟清理密码直到重新加密
+                            }
+                        }
+
+                        if (DebugMode) // Assuming DebugMode is a static boolean field
+                        {
+                            Console.WriteLine("\n调试信息 (解密参数):");
+                            Console.WriteLine(debugInfo);
+                            Console.WriteLine($"检测到的加密模式: {originalMode}");
+                        }
+
+                        // 创建临时文件
+                        string tempFileName = "textcrypt_mount_decrypted_" + Guid.NewGuid().ToString("N") + ".txt";
+                        string tempFilePath = Path.Combine(Path.GetTempPath(), tempFileName);
+                        File.WriteAllBytes(tempFilePath, decryptedBytes);
+                        Console.WriteLine($"\n√ 解密成功，明文已保存到临时文件: {tempFilePath}");
+
+                        // 自动打开编辑器
                         Console.WriteLine($"\n正在使用默认编辑器打开临时文件: {tempFilePath}");
                         Console.WriteLine("请编辑内容，保存并关闭编辑器后返回。");
-
                         var editorProcess = new Process
                         {
                             StartInfo = new ProcessStartInfo
@@ -554,7 +594,6 @@ ooooooooooooo                           .     .oooooo.                          
                                 UseShellExecute = true
                             }
                         };
-
                         try
                         {
                             editorProcess.Start();
@@ -563,303 +602,397 @@ ooooooooooooo                           .     .oooooo.                          
                         catch (Exception ex)
                         {
                             Console.WriteLine($"启动编辑器失败: {ex.Message}");
-                            Console.Write("是否取消操作？(y/n): ");
-                            if (Console.ReadLine()?.ToLower() == "y")
+                            Console.Write("是否继续挂载？(y/n): ");
+                            if (Console.ReadLine()?.ToLower() != "y")
                             {
-                                return;
+                                if (File.Exists(tempFilePath))
+                                {
+                                    try
+                                    {
+                                        File.Delete(tempFilePath);
+                                    }
+                                    catch (Exception ex2)
+                                    {
+                                        Console.WriteLine($"警告: 删除临时文件 {tempFilePath} 失败: {ex2.Message}");
+                                    }
+                                }
+                                if (decryptedBytes != null) Array.Clear(decryptedBytes, 0, decryptedBytes.Length);
+                                if (originalPassword != null) Array.Clear(originalPassword, 0, originalPassword.Length);
+                                continue;
                             }
-                            continue;
                         }
 
-                        Console.Write("\n编辑完成？ (y - 完成并继续(对于内容有改动) / r - 重新编辑 / c - 取消操作(对于仅查看)): ");
-                        string confirmation = Console.ReadLine()?.ToLower();
-
-                        if (confirmation == "y")
+                        // 更新解密后的明文
+                        byte[] editedPlaintextBytesAtMount = File.ReadAllBytes(tempFilePath); // Changed variable name
+                        if (decryptedBytes != null) Array.Clear(decryptedBytes, 0, decryptedBytes.Length);
+                        // 添加到挂载列表
+                        mountedCiphertexts.Add((encryptedText, selectedFile, tempFilePath, editedPlaintextBytesAtMount, originalMode, originalPassword, privateKeyBase64, isV3Mode, debugInfo));
+                        Console.WriteLine("密文已挂载。");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"\n解密失败: {ex.Message}");
+                        if (DebugMode && ex.InnerException != null)
                         {
-                            editingConfirmed = true;
+                            Console.WriteLine($"内部错误: {ex.InnerException.Message}");
                         }
-                        else if (confirmation == "r")
-                        {
-                            // 继续循环，重新打开编辑器
-                        }
-                        else
-                        {
-                            Console.WriteLine("操作取消。");
-                            return;
-                        }
+                        if (decryptedBytes != null) Array.Clear(decryptedBytes, 0, decryptedBytes.Length);
+                        if (originalPassword != null) Array.Clear(originalPassword, 0, originalPassword.Length);
+                        continue;
+                    }
+                }
+                else if (choice == "2")
+                {
+                    // 显示挂载密文列表并处理操作
+                    if (!mountedCiphertexts.Any())
+                    {
+                        Console.WriteLine("\n当前没有挂载的密文。");
+                        continue;
                     }
 
-                    // 读取用户编辑后的明文
-                    byte[] editedPlaintextBytes = File.ReadAllBytes(tempFilePath);
-                    Console.WriteLine("\n已读取编辑后的明文。");
-
-                    // 调试信息：检查明文和密码
-                    if (DebugMode)
+                    Console.WriteLine("\n=== 已挂载密文列表 ===");
+                    for (int i = 0; i < mountedCiphertexts.Count; i++)
                     {
-                        Console.WriteLine($"编辑后的明文长度: {editedPlaintextBytes.Length} 字节");
-                        Console.WriteLine($"原密码长度: {(originalPassword != null ? originalPassword.Length : 0)} 字符");
+                        var item = mountedCiphertexts[i];
+                        Console.WriteLine($"{i + 1}. 文件: {(string.IsNullOrEmpty(item.FilePath) ? "手动输入密文" : item.FilePath)}, 模式: {item.OriginalMode}, 临时文件: {item.TempFilePath}");
                     }
 
-                    // 询问是否重新设置加密密码/公钥
-                    Console.Write("\n是否重新设置加密密码/公钥？(y/n, 默认n): ");
-                    bool resetEncryption = Console.ReadLine()?.ToLower() == "y";
-
-                    string newEncryptedText = null;
-                    string newDebugInfo = null;
-
-                    if (!resetEncryption)
+                    Console.Write("\n请输入密文序号 (或 'r' 返回): ");
+                    var indexInput = Console.ReadLine()?.Trim().ToLower();
+                    if (indexInput == "r")
                     {
-                        // 使用原密码或公钥重新加密
-                        if (isV3Mode && !string.IsNullOrEmpty(privateKeyBase64))
-                        {
-                            Console.WriteLine("\n正在使用原公钥重新加密，请稍候...");
+                        continue;
+                    }
+
+                    if (!int.TryParse(indexInput, out int index) || index < 1 || index > mountedCiphertexts.Count)
+                    {
+                        Console.WriteLine("无效序号，操作取消。");
+                        continue;
+                    }
+
+                    var selectedCiphertext = mountedCiphertexts[index - 1];
+                    Console.WriteLine($"\n已选择密文: {(string.IsNullOrEmpty(selectedCiphertext.FilePath) ? "手动输入" : selectedCiphertext.FilePath)}");
+
+                    Console.WriteLine("\n操作选项:");
+                    Console.WriteLine("1. 重新打开编辑器");
+                    Console.WriteLine("2. 重新加密");
+                    Console.WriteLine("3. 取消挂载 (删除临时文件)");
+                    Console.Write("请输入选择: ");
+                    var actionChoice = Console.ReadLine();
+
+                    // Declare editedPlaintextBytesA outside the switch to avoid redefinition issues
+                    byte[] editedPlaintextBytesA = null;
+
+                    switch (actionChoice)
+                    {
+                        case "1":
+                            // 重新打开编辑器
+                            Console.WriteLine($"\n正在使用默认编辑器打开临时文件: {selectedCiphertext.TempFilePath}");
+                            Console.WriteLine("请编辑内容，保存并关闭编辑器后返回。");
+
+                            var editorProcess = new Process
+                            {
+                                StartInfo = new ProcessStartInfo
+                                {
+                                    FileName = selectedCiphertext.TempFilePath,
+                                    UseShellExecute = true
+                                }
+                            };
+
                             try
                             {
-                                (newEncryptedText, newDebugInfo) = EncryptTextV3(editedPlaintextBytes, privateKeyBase64);
+                                editorProcess.Start();
+                                editorProcess.WaitForExit();
                             }
                             catch (Exception ex)
                             {
-                                Console.WriteLine($"重新加密失败: {ex.Message}");
-                                return;
+                                Console.WriteLine($"启动编辑器失败: {ex.Message}");
+                                Console.Write("是否取消操作？(y/n): ");
+                                if (Console.ReadLine()?.ToLower() == "y")
+                                {
+                                    break;
+                                }
+                                continue;
                             }
-                        }
-                        else if (originalPassword != null && !string.IsNullOrEmpty(originalMode))
-                        {
-                            Console.WriteLine($"\n正在使用原密码和模式 {originalMode} 重新加密，请稍候...");
-                            try
+
+                            // 更新解密后的明文
+                            editedPlaintextBytesA = File.ReadAllBytes(selectedCiphertext.TempFilePath);
+                            if (selectedCiphertext.DecryptedBytes != null) Array.Clear(selectedCiphertext.DecryptedBytes, 0, selectedCiphertext.DecryptedBytes.Length);
+                            mountedCiphertexts[index - 1] = (selectedCiphertext.EncryptedText, selectedCiphertext.FilePath, selectedCiphertext.TempFilePath, editedPlaintextBytesA, selectedCiphertext.OriginalMode, selectedCiphertext.OriginalPassword, selectedCiphertext.PrivateKeyBase64, selectedCiphertext.IsV3Mode, selectedCiphertext.DebugInfo);
+                            Console.WriteLine("\n已更新编辑后的明文。");
+                            break;
+
+                        case "2":
+                            // 重新加密
+                            editedPlaintextBytesA = File.ReadAllBytes(selectedCiphertext.TempFilePath);
+                            if (DebugMode)
                             {
-                                // 验证输入
-                                if (editedPlaintextBytes == null || editedPlaintextBytes.Length == 0)
-                                {
-                                    throw new Exception("编辑后的明文为空，无法加密。");
-                                }
-                                if (originalPassword.Length == 0)
-                                {
-                                    throw new Exception("原密码为空，无法加密。");
-                                }
-                                (newEncryptedText, newDebugInfo) = EncryptText(editedPlaintextBytes, originalPassword, originalMode);
-                                if (string.IsNullOrEmpty(newEncryptedText))
-                                {
-                                    throw new Exception("加密结果为空，重新加密失败。");
-                                }
-                                // 验证加密结果是否可解密
+                                Console.WriteLine($"\n编辑后的明文长度: {editedPlaintextBytesA.Length} 字节");
+                                Console.WriteLine($"原密码长度: {(selectedCiphertext.OriginalPassword != null ? selectedCiphertext.OriginalPassword.Length : 0)} 字符");
+                            }
+
+                            Console.Write("\n是否重新设置加密密码/公钥？(y/n, 默认n): ");
+                            bool resetEncryption = Console.ReadLine()?.ToLower() == "y";
+
+                            string newEncryptedText = null;
+                            string newDebugInfo = null;
+                            string mode = selectedCiphertext.OriginalMode; // 默认使用原模式
+
+                            if (!resetEncryption)
+                            {
+                                // 使用原密码或公钥重新加密
                                 try
                                 {
-                                    var (testDecryptedBytes, testDebugInfo) = DecryptText(newEncryptedText, originalPassword);
-                                    if (testDecryptedBytes == null)
+                                    if (selectedCiphertext.IsV3Mode && !string.IsNullOrEmpty(selectedCiphertext.PrivateKeyBase64))
                                     {
-                                        throw new Exception("验证解密失败: 解密结果为空。");
+                                        Console.WriteLine("\n正在使用原公钥重新加密，请稍候...");
+                                        // Assuming EncryptTextV3 exists and returns (string, string)
+                                        (newEncryptedText, newDebugInfo) = EncryptTextV3(editedPlaintextBytesA, selectedCiphertext.PrivateKeyBase64);
                                     }
-                                    if (!testDecryptedBytes.SequenceEqual(editedPlaintextBytes))
+                                    else if (selectedCiphertext.OriginalPassword != null && !string.IsNullOrEmpty(selectedCiphertext.OriginalMode))
                                     {
-                                        throw new Exception("重新加密后的密文无法正确解密，加密参数可能不一致。");
+                                        Console.WriteLine($"\n正在使用原密码和模式 {selectedCiphertext.OriginalMode} 重新加密，请稍候...");
+                                        if (editedPlaintextBytesA == null || editedPlaintextBytesA.Length == 0)
+                                        {
+                                            throw new Exception("编辑后的明文为空，无法加密。");
+                                        }
+                                        if (selectedCiphertext.OriginalPassword.Length == 0)
+                                        {
+                                            throw new Exception("原密码为空，无法加密。");
+                                        }
+                                        // Assuming EncryptText exists and returns (string, string)
+                                        (newEncryptedText, newDebugInfo) = EncryptText(editedPlaintextBytesA, selectedCiphertext.OriginalPassword, selectedCiphertext.OriginalMode);
+                                        if (string.IsNullOrEmpty(newEncryptedText))
+                                        {
+                                            throw new Exception("加密结果为空，重新加密失败。");
+                                        }
+                                        // 验证加密结果
+                                        // Assuming DecryptText exists and returns (byte[], string)
+                                        var (testDecryptedBytes, testDebugInfo) = DecryptText(newEncryptedText, selectedCiphertext.OriginalPassword);
+                                        if (testDecryptedBytes == null || !testDecryptedBytes.SequenceEqual(editedPlaintextBytesA))
+                                        {
+                                            throw new Exception("重新加密后的密文无法正确解密。");
+                                        }
+                                        if (DebugMode)
+                                        {
+                                            Console.WriteLine("\n验证调试信息:");
+                                            Console.WriteLine(testDebugInfo);
+                                        }
                                     }
-                                    if (DebugMode)
+                                    else
                                     {
-                                        Console.WriteLine("\n验证调试信息:");
-                                        Console.WriteLine(testDebugInfo);
+                                        Console.WriteLine("无法使用原密码/公钥重新加密，操作取消。");
+                                        continue;
                                     }
                                 }
                                 catch (Exception ex)
                                 {
-                                    Console.WriteLine($"加密验证失败: {ex.Message}");
+                                    Console.WriteLine($"重新加密失败: {ex.Message}");
                                     if (DebugMode && ex.InnerException != null)
                                     {
                                         Console.WriteLine($"内部错误: {ex.InnerException.Message}");
                                     }
-                                    return;
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"重新加密失败: {ex.Message}");
-                                if (DebugMode && ex.InnerException != null)
-                                {
-                                    Console.WriteLine($"内部错误: {ex.InnerException.Message}");
-                                }
-                                return;
-                            }
-                        }
-                        else
-                        {
-                            Console.WriteLine("无法使用原密码/公钥重新加密，操作取消。");
-                            return;
-                        }
-                    }
-                    else
-                    {
-                        // 进入新的加密流程
-                        Console.WriteLine("\n=== 重新加密 ===");
-                        Console.WriteLine("\n请选择加密模式:");
-                        Console.WriteLine("1. 双层加密 (V1)");
-                        Console.WriteLine("2. 直接加密 (V2, 推荐)");
-                        Console.WriteLine("3. 盐值随机模式 (V0.5)");
-                        Console.WriteLine("4. 核心直加密模式 (V0)");
-                        Console.WriteLine("5. V3 非对称加密");
-                        Console.Write("请输入选项 (默认为 2): ");
-                        string modeChoice = Console.ReadLine()?.Trim();
-
-                        string mode;
-                        switch (modeChoice)
-                        {
-                            case "1": mode = "V1"; break;
-                            case "3": mode = "V0.5"; break;
-                            case "4": mode = "V0"; break;
-                            case "5": mode = "V3"; break;
-                            default: mode = "V2"; break;
-                        }
-
-                        if (mode == "V3")
-                        {
-                            string publicKeyBase64 = SelectPublicKeyFile();
-                            if (string.IsNullOrEmpty(publicKeyBase64))
-                            {
-                                Console.WriteLine("未选择有效的公钥文件，操作取消。");
-                                return;
-                            }
-                            Console.WriteLine("\n正在使用 V3 非对称加密，请稍候...");
-                            try
-                            {
-                                (newEncryptedText, newDebugInfo) = EncryptTextV3(editedPlaintextBytes, publicKeyBase64);
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"V3 加密失败: {ex.Message}");
-                                return;
-                            }
-                        }
-                        else
-                        {
-                            Console.Write("\n请输入新密码: ");
-                            char[] newPassword = ReadPassword();
-                            try
-                            {
-                                if (newPassword == null || newPassword.Length == 0)
-                                {
-                                    Console.WriteLine("\n密码不能为空，操作取消。");
-                                    return;
-                                }
-                                Console.Write("\n请再次输入新密码: ");
-                                char[] confirmPassword = ReadPassword();
-                                try
-                                {
-                                    if (!newPassword.SequenceEqual(confirmPassword))
-                                    {
-                                        Console.WriteLine("\n两次输入的密码不一致，操作取消。");
-                                        return;
-                                    }
-                                    Console.WriteLine("\n正在加密，请稍候...");
-                                    (newEncryptedText, newDebugInfo) = EncryptText(editedPlaintextBytes, newPassword, mode);
-                                }
-                                finally
-                                {
-                                    if (confirmPassword != null) Array.Clear(confirmPassword, 0, confirmPassword.Length);
-                                }
-                            }
-                            finally
-                            {
-                                if (newPassword != null) Array.Clear(newPassword, 0, newPassword.Length);
-                            }
-                        }
-                    }
-
-                    if (DebugMode)
-                    {
-                        Console.WriteLine("\n调试信息 (加密参数):");
-                        Console.WriteLine(newDebugInfo);
-                    }
-
-                    // 询问密文输出方式
-                    Console.WriteLine("\n加密结果输出方式:");
-                    Console.WriteLine("1. 直接显示");
-                    Console.WriteLine("2. 覆盖原文件");
-                    Console.WriteLine("3. 另存为新文件");
-                    Console.Write("请选择 (1-3): ");
-                    var outputChoice = Console.ReadLine();
-
-                    switch (outputChoice)
-                    {
-                        case "1":
-                            Console.WriteLine($"\n加密结果:\n{newEncryptedText}");
-                            Console.WriteLine("\n按下回车返回主菜单");
-                            Console.ReadLine();
-                            break;
-
-                        case "2":
-                            if (choice == "2" && !string.IsNullOrEmpty(selectedFile))
-                            {
-                                try
-                                {
-                                    File.WriteAllText(selectedFile, newEncryptedText);
-                                    Console.WriteLine($"\n加密结果已覆盖原文件: {selectedFile}");
-                                }
-                                catch (Exception ex)
-                                {
-                                    Console.WriteLine($"覆盖文件失败: {ex.Message}");
+                                    continue;
                                 }
                             }
                             else
                             {
-                                Console.WriteLine("没有可覆盖的原文件，将直接显示结果。");
-                                Console.WriteLine($"\n加密结果:\n{newEncryptedText}");
+                                // 新加密流程
+                                Console.WriteLine("\n=== 重新加密 ===");
+                                Console.WriteLine("\n请选择加密模式:");
+                                Console.WriteLine("1. 双层加密 (V1)");
+                                Console.WriteLine("2. 直接加密 (V2, 推荐)");
+                                Console.WriteLine("3. 盐值随机模式 (V0.5)");
+                                Console.WriteLine("4. 核心直加密模式 (V0)");
+                                Console.WriteLine("5. V3 非对称加密");
+                                Console.Write("请输入选项 (默认为 2): ");
+                                string modeChoice = Console.ReadLine()?.Trim();
+
+                                switch (modeChoice)
+                                {
+                                    case "1": mode = "V1"; break;
+                                    case "3": mode = "V0.5"; break;
+                                    case "4": mode = "V0"; break;
+                                    case "5": mode = "V3"; break;
+                                    default: mode = "V2"; break;
+                                }
+
+                                try
+                                {
+                                    if (mode == "V3")
+                                    {
+                                        // Assuming SelectPublicKeyFile exists and returns string
+                                        string publicKeyBase64 = SelectPublicKeyFile();
+                                        if (string.IsNullOrEmpty(publicKeyBase64))
+                                        {
+                                            Console.WriteLine("未选择有效的公钥文件，操作取消。");
+                                            continue;
+                                        }
+                                        Console.WriteLine("\n正在使用 V3 非对称加密，请稍候...");
+                                        // Assuming EncryptTextV3 exists and returns (string, string)
+                                        (newEncryptedText, newDebugInfo) = EncryptTextV3(editedPlaintextBytesA, publicKeyBase64);
+                                    }
+                                    else
+                                    {
+                                        Console.Write("\n请输入新密码: ");
+                                        // Assuming ReadPassword exists and returns char[]
+                                        char[] newPassword = ReadPassword();
+                                        try
+                                        {
+                                            if (newPassword == null || newPassword.Length == 0)
+                                            {
+                                                Console.WriteLine("\n密码不能为空，操作取消。");
+                                                continue;
+                                            }
+                                            Console.Write("\n请再次输入新密码: ");
+                                            char[] confirmPassword = ReadPassword();
+                                            try
+                                            {
+                                                if (!newPassword.SequenceEqual(confirmPassword))
+                                                {
+                                                    Console.WriteLine("\n两次输入的密码不一致，操作取消。");
+                                                    continue;
+                                                }
+                                                Console.WriteLine("\n正在加密，请稍候...");
+                                                // Assuming EncryptText exists and returns (string, string)
+                                                (newEncryptedText, newDebugInfo) = EncryptText(editedPlaintextBytesA, newPassword, mode);
+                                                // 更新原密码
+                                                if (selectedCiphertext.OriginalPassword != null) Array.Clear(selectedCiphertext.OriginalPassword, 0, selectedCiphertext.OriginalPassword.Length);
+                                                mountedCiphertexts[index - 1] = (selectedCiphertext.EncryptedText, selectedCiphertext.FilePath, selectedCiphertext.TempFilePath, editedPlaintextBytesA, mode, newPassword, selectedCiphertext.PrivateKeyBase64, selectedCiphertext.IsV3Mode, newDebugInfo);
+                                            }
+                                            finally
+                                            {
+                                                if (confirmPassword != null) Array.Clear(confirmPassword, 0, confirmPassword.Length);
+                                            }
+                                        }
+                                        finally
+                                        {
+                                            // 延迟清理 newPassword，直到挂载列表更新
+                                        }
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine($"加密失败: {ex.Message}");
+                                    if (DebugMode && ex.InnerException != null)
+                                    {
+                                        Console.WriteLine($"内部错误: {ex.InnerException.Message}");
+                                    }
+                                    continue;
+                                }
                             }
+
+                            if (DebugMode)
+                            {
+                                Console.WriteLine("\n调试信息 (加密参数):");
+                                Console.WriteLine(newDebugInfo);
+                            }
+
+                            // 输出密文
+                            Console.WriteLine("\n加密结果输出方式:");
+                            Console.WriteLine("1. 直接显示");
+                            Console.WriteLine("2. 覆盖原文件");
+                            Console.WriteLine("3. 另存为新文件");
+                            Console.Write("请选择 (1-3): ");
+                            var outputChoice = Console.ReadLine();
+
+                            switch (outputChoice)
+                            {
+                                case "1":
+                                    Console.WriteLine($"\n加密结果:\n{newEncryptedText}");
+                                    Console.WriteLine("\n按下回车继续");
+                                    Console.ReadLine();
+                                    break;
+
+                                case "2":
+                                    if (!string.IsNullOrEmpty(selectedCiphertext.FilePath))
+                                    {
+                                        try
+                                        {
+                                            File.WriteAllText(selectedCiphertext.FilePath, newEncryptedText);
+                                            Console.WriteLine($"\n加密结果已覆盖原文件: {selectedCiphertext.FilePath}");
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Console.WriteLine($"覆盖文件失败: {ex.Message}");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        Console.WriteLine("没有可覆盖的原文件，将直接显示结果。");
+                                        Console.WriteLine($"\n加密结果:\n{newEncryptedText}");
+                                    }
+                                    break;
+
+                                case "3":
+                                    Console.Write("\n请输入新文件路径: ");
+                                    string newFilePath = Console.ReadLine()?.Trim('"');
+                                    if (!string.IsNullOrEmpty(newFilePath))
+                                    {
+                                        try
+                                        {
+                                            File.WriteAllText(newFilePath, newEncryptedText);
+                                            Console.WriteLine($"\n加密结果已保存到: {newFilePath}");
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Console.WriteLine($"保存文件失败: {ex.Message}");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        Console.WriteLine("未提供文件路径，将直接显示结果。");
+                                        Console.WriteLine($"\n加密结果:\n{newEncryptedText}");
+                                    }
+                                    break;
+
+                                default:
+                                    Console.WriteLine($"\n无效选择，将直接显示结果:\n{newEncryptedText}");
+                                    break;
+                            }
+
+                            // 更新密文 (此处逻辑已经更新了 mountedCiphertexts[index - 1]，不再需要重复更新 DecryptedBytes)
+                            // Note: The previous logic had a potential issue with `mountedCiphertexts[index - 1].OriginalPassword` being cleared too early
+                            // The tuple assignment inside the resetEncryption block already handles the update.
+                            // If you need to clear the old decryptedBytes, do it before assigning new ones.
+                            if (selectedCiphertext.DecryptedBytes != null) Array.Clear(selectedCiphertext.DecryptedBytes, 0, selectedCiphertext.DecryptedBytes.Length);
+                            // The line below ensures the updated `newEncryptedText` is stored in the tuple.
+                            // The `editedPlaintextBytesA` passed to the tuple here is the *last read* plaintext, which is correct.
+                            mountedCiphertexts[index - 1] = (newEncryptedText, selectedCiphertext.FilePath, selectedCiphertext.TempFilePath, editedPlaintextBytesA, mode, mountedCiphertexts[index - 1].OriginalPassword, selectedCiphertext.PrivateKeyBase64, selectedCiphertext.IsV3Mode, newDebugInfo);
                             break;
 
                         case "3":
-                            Console.Write("\n请输入新文件路径: ");
-                            string newFilePath = Console.ReadLine()?.Trim('"');
-                            if (!string.IsNullOrEmpty(newFilePath))
+                            // 取消挂载
+                            if (File.Exists(selectedCiphertext.TempFilePath))
                             {
                                 try
                                 {
-                                    File.WriteAllText(newFilePath, newEncryptedText);
-                                    Console.WriteLine($"\n加密结果已保存到: {newFilePath}");
+                                    File.Delete(selectedCiphertext.TempFilePath);
+                                    Console.WriteLine($"\n临时文件 {selectedCiphertext.TempFilePath} 已删除。");
                                 }
                                 catch (Exception ex)
                                 {
-                                    Console.WriteLine($"保存文件失败: {ex.Message}");
+                                    Console.WriteLine($"警告: 删除临时文件 {selectedCiphertext.TempFilePath} 失败: {ex.Message}");
                                 }
                             }
-                            else
-                            {
-                                Console.WriteLine("未提供文件路径，将直接显示结果。");
-                                Console.WriteLine($"\n加密结果:\n{newEncryptedText}");
-                            }
+                            if (selectedCiphertext.DecryptedBytes != null) Array.Clear(selectedCiphertext.DecryptedBytes, 0, selectedCiphertext.DecryptedBytes.Length);
+                            if (selectedCiphertext.OriginalPassword != null) Array.Clear(selectedCiphertext.OriginalPassword, 0, selectedCiphertext.OriginalPassword.Length);
+                            mountedCiphertexts.RemoveAt(index - 1);
+                            Console.WriteLine("密文已取消挂载。");
                             break;
 
                         default:
-                            Console.WriteLine($"\n无效选择，将直接显示结果:\n{newEncryptedText}");
+                            Console.WriteLine("无效选择，操作取消。");
                             break;
                     }
                 }
-                finally
+                else
                 {
-                    // 清理临时文件
-                    if (File.Exists(tempFilePath))
-                    {
-                        try
-                        {
-                            File.Delete(tempFilePath);
-                            Console.WriteLine($"\n临时文件 {tempFilePath} 已删除。");
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"警告: 删除临时文件 {tempFilePath} 失败: {ex.Message}");
-                        }
-                    }
-                    if (decryptedBytes != null) Array.Clear(decryptedBytes, 0, decryptedBytes.Length);
-                    if (originalPassword != null) Array.Clear(originalPassword, 0, originalPassword.Length);
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"\n操作失败: {ex.Message}");
-                if (DebugMode && ex.InnerException != null)
-                {
-                    Console.WriteLine($"内部错误: {ex.InnerException.Message}");
+                    Console.WriteLine("无效选择，请重试。");
                 }
             }
         }
+
 
         // 辅助方法：选择加密文件
         static string ChooseEncryptedFile()
@@ -1441,6 +1574,7 @@ ooooooooooooo                           .     .oooooo.                          
                 Console.WriteLine("3. 盐值随机模式 (仅用盐值增加随机性，AES-256-ECB加密 - V0.5) 密文稍短于V2");
                 Console.WriteLine("4. 核心直加密模式 (无盐值，确定性加密，AES-256-ECB - V0) 密文最短，同一密码同一明文下，密文也同一");
                 Console.WriteLine("5. V3 非对称加密 (使用公钥加密)");
+                Console.WriteLine("6. V3S 非对称加密 (公钥加密 + 私钥签名)，带验证、不可否认性");
                 Console.Write("请输入选项 (默认为 2): ");
                 string modeChoiceStr = Console.ReadLine()?.Trim();
 
@@ -1451,6 +1585,7 @@ ooooooooooooo                           .     .oooooo.                          
                     case "3": mode = "V0.5"; break;
                     case "4": mode = "V0"; break;
                     case "5": mode = "V3"; break;
+                    case "6": mode = "V3S"; break;
                     default: mode = "V2"; break; // Includes "2" or empty
                 }
 
@@ -1460,6 +1595,7 @@ ooooooooooooo                           .     .oooooo.                          
                     "V0.5" => "盐值随机模式 (V0.5)",
                     "V0" => "核心直加密模式 (V0)",
                     "V3" => "V3 非对称加密",
+                    "V3S" => "V3S 非对称加密",
                     _ => "直接加密 (新V2架构, 推荐)"
                 };
                 Console.WriteLine($"已选择: {selectedModeName}");
@@ -1542,6 +1678,100 @@ ooooooooooooo                           .     .oooooo.                          
                         catch (Exception ex)
                         {
                             Console.WriteLine($"\nV3 加密失败: {ex.Message}");
+                            return;
+                        }
+                    }
+                    else if (mode == "V3S")
+                    {
+                        Console.WriteLine($"当前工作目录: {Environment.CurrentDirectory}");
+                        // 选择接收方公钥
+                        var pubFiles = Directory.GetFiles(Environment.CurrentDirectory, "*.pub", SearchOption.AllDirectories);
+                        string pubPath;
+                        if (pubFiles.Length > 0)
+                        {
+                            Console.WriteLine("\n检测到的 .pub 文件：");
+                            for (int i = 0; i < pubFiles.Length; i++)
+                            {
+                                Console.WriteLine($"  {i + 1}. {Path.GetRelativePath(Environment.CurrentDirectory, pubFiles[i])}");
+                            }
+                            Console.WriteLine($"  {pubFiles.Length + 1}. 自定义路径");
+                            Console.Write($"输入选项 (1-{pubFiles.Length + 1}): ");
+                            if (!int.TryParse(Console.ReadLine(), out int choice) || choice < 1 || choice > pubFiles.Length + 1)
+                            {
+                                Console.WriteLine("无效选择，取消操作。");
+                                return;
+                            }
+                            if (choice == pubFiles.Length + 1)
+                            {
+                                Console.Write("请输入公钥文件路径: ");
+                                pubPath = Console.ReadLine()?.Trim('"');
+                            }
+                            else
+                            {
+                                pubPath = pubFiles[choice - 1];
+                                Console.WriteLine($"已选择文件: {Path.GetRelativePath(Environment.CurrentDirectory, pubPath)}");
+                            }
+                        }
+                        else
+                        {
+                            Console.Write("未找到 .pub 文件，请输入公钥路径: ");
+                            pubPath = Console.ReadLine()?.Trim('"');
+                        }
+                        if (string.IsNullOrWhiteSpace(pubPath) || !File.Exists(pubPath))
+                        {
+                            Console.WriteLine("公钥文件不存在，取消操作。");
+                            return;
+                        }
+                        string recipientPubBase64 = File.ReadAllText(pubPath).Trim();
+
+                        // 选择发送方私钥
+                        var pemFiles = Directory.GetFiles(Environment.CurrentDirectory, "*.pem", SearchOption.AllDirectories);
+                        string pemPath;
+                        if (pemFiles.Length > 0)
+                        {
+                            Console.WriteLine("\n检测到的 .pem 文件：");
+                            for (int i = 0; i < pemFiles.Length; i++)
+                            {
+                                Console.WriteLine($"  {i + 1}. {Path.GetRelativePath(Environment.CurrentDirectory, pemFiles[i])}");
+                            }
+                            Console.WriteLine($"  {pemFiles.Length + 1}. 自定义路径");
+                            Console.Write($"输入选项 (1-{pemFiles.Length + 1}): ");
+                            if (!int.TryParse(Console.ReadLine(), out int choice2) || choice2 < 1 || choice2 > pemFiles.Length + 1)
+                            {
+                                Console.WriteLine("无效选择，取消操作。");
+                                return;
+                            }
+                            if (choice2 == pemFiles.Length + 1)
+                            {
+                                Console.Write("请输入私钥文件路径: ");
+                                pemPath = Console.ReadLine()?.Trim('"');
+                            }
+                            else
+                            {
+                                pemPath = pemFiles[choice2 - 1];
+                                Console.WriteLine($"已选择文件: {Path.GetRelativePath(Environment.CurrentDirectory, pemPath)}");
+                            }
+                        }
+                        else
+                        {
+                            Console.Write("未找到 .pem 文件，请输入私钥路径: ");
+                            pemPath = Console.ReadLine()?.Trim('"');
+                        }
+                        if (string.IsNullOrWhiteSpace(pemPath) || !File.Exists(pemPath))
+                        {
+                            Console.WriteLine("私钥文件不存在，取消操作。");
+                            return;
+                        }
+                        string senderPrivBase64 = File.ReadAllText(pemPath).Trim();
+
+                        try
+                        {
+                            Console.WriteLine("\n正在使用 V3S 非对称加密，请稍候...");
+                            (encrypted, debugInfo) = EncryptTextV3S(plaintextBytes, recipientPubBase64, senderPrivBase64);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"V3S 加密失败: {ex.Message}");
                             return;
                         }
                     }
@@ -1671,6 +1901,124 @@ ooooooooooooo                           .     .oooooo.                          
             return password;
         }
 
+        //V3S-
+        static (string encryptedText, string debugInfo) EncryptTextV3S(byte[] plaintextBytes, string recipientPublicKeyBase64, string senderPrivateKeyBase64)
+        {
+            byte[] recipientPublicKeyBytes = null;
+            byte[] senderPrivateKeyBytes = null;
+            byte[] senderPublicKeyBytes = null; // 新增：存储发送方公钥
+            byte[] ephemeralPublicKeyBytes = null;
+            byte[] sharedSecret = null;
+            byte[] aesKey = null;
+            byte[] gcmIv = null;
+            byte[] gcmTag = new byte[16];
+            byte[] cipherTextBytes = new byte[plaintextBytes.Length];
+            byte[] signatureBytes = null;
+
+            try
+            {
+                recipientPublicKeyBase64 = recipientPublicKeyBase64
+                    .Replace("-----BEGIN PUBLIC KEY-----", "")
+                    .Replace("-----END PUBLIC KEY-----", "")
+                    .Replace("\n", "")
+                    .Replace("\r", "")
+                    .Trim();
+
+                senderPrivateKeyBase64 = senderPrivateKeyBase64
+                    .Replace("-----BEGIN PRIVATE KEY-----", "")
+                    .Replace("-----END PRIVATE KEY-----", "")
+                    .Replace("\n", "")
+                    .Replace("\r", "")
+                    .Trim();
+
+                // 1. 导入接收方的公钥
+                recipientPublicKeyBytes = Convert.FromBase64String(recipientPublicKeyBase64);
+                using var recipientPublicKey = ECDiffieHellman.Create();
+                recipientPublicKey.ImportSubjectPublicKeyInfo(recipientPublicKeyBytes, out _);
+
+                // 2. 导入发送方的私钥（用于签名）并导出公钥
+                senderPrivateKeyBytes = Convert.FromBase64String(senderPrivateKeyBase64);
+                using var senderPrivateKey = ECDsa.Create();
+                senderPrivateKey.ImportPkcs8PrivateKey(senderPrivateKeyBytes, out _);
+                senderPublicKeyBytes = senderPrivateKey.ExportSubjectPublicKeyInfo(); // 导出公钥
+
+                // 3. 创建一个临时的 (ephemeral) 密钥对
+                using var ephemeralEcdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP521);
+                ephemeralPublicKeyBytes = ephemeralEcdh.ExportSubjectPublicKeyInfo();
+
+                // 4. 使用临时私钥和接收方公钥派生共享密钥
+                sharedSecret = ephemeralEcdh.DeriveKeyFromHash(recipientPublicKey.PublicKey, HashAlgorithmName.SHA512);
+
+                // 5. 使用 HKDF 从共享密钥派生出用于 AES 加密的密钥
+                aesKey = HKDF.DeriveKey(HashAlgorithmName.SHA512, sharedSecret, 32, null, Encoding.UTF8.GetBytes("TextCryptV3S-AES256GCM"));
+
+                // 6. 使用 AES-GCM 加密
+                gcmIv = GenerateRandomBytes(12);
+                using (var aesGcm = new AesGcm(aesKey))
+                {
+                    aesGcm.Encrypt(gcmIv, plaintextBytes, cipherTextBytes, gcmTag, null);
+                }
+
+                // 7. 使用发送方私钥对密文进行签名
+                // 修复：使用 Program.Combine 确保数据拼接一致性
+                var dataToSign = Program.Combine(cipherTextBytes, gcmTag, gcmIv);
+
+                signatureBytes = senderPrivateKey.SignData(dataToSign, HashAlgorithmName.SHA512);
+
+                // 8. 构建 V3S 数据包
+                var envelope = new EnvelopeData
+                {
+                    V = "3S",
+                    EK = Convert.ToBase64String(ephemeralPublicKeyBytes),
+                    I = Convert.ToBase64String(gcmIv),
+                    C = Convert.ToBase64String(cipherTextBytes),
+                    T = Convert.ToBase64String(gcmTag),
+                    Sig = Convert.ToBase64String(signatureBytes)
+                };
+
+                string json = JsonSerializer.Serialize(envelope, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+                byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
+
+                // 9. 使用接收方公钥作为"密码"进行自定义编码
+                var (shuffledCharset, _, customBase) = GeneratePasswordDerivedCharset(recipientPublicKeyBase64);
+                string encryptedText = BytesToPasswordDerivedBaseString(jsonBytes, shuffledCharset, customBase);
+
+                string debugInfo = DebugMode ? $@"加密参数 (非对称加密 V3S):
+- Sender Private Key (Base64): {senderPrivateKeyBase64}
+- Sender Public Key (Base64): {Convert.ToBase64String(senderPublicKeyBytes)}
+- Recipient Public Key (Base64): {recipientPublicKeyBase64}
+- JSON Content: {json}
+- Ephemeral Public Key (Base64): {envelope.EK}
+- AES-GCM IV (Base64): {envelope.I}
+- AES-GCM Tag (Base64): {envelope.T}
+- Ciphertext (Base64): {envelope.C}
+- Signature Data Length: {dataToSign.Length}
+- Signature Data (Hex): {BitConverter.ToString(dataToSign).Replace("-", "")}
+- Signature (ECDSA SHA512, Base64): {envelope.Sig}
+- Shared Secret (SHA512, Base64): {Convert.ToBase64String(sharedSecret)}
+- Derived AES Key (HKDF, Base64): {Convert.ToBase64String(aesKey)}
+- Custom Encoding Charset derived from: Recipient Public Key" : string.Empty;
+
+                return (encryptedText, debugInfo);
+            }
+            catch (Exception ex)
+            {
+                throw new CryptographicException($"V3S encryption failed: {ex.Message}", ex);
+            }
+            finally
+            {
+                if (recipientPublicKeyBytes != null) Array.Clear(recipientPublicKeyBytes, 0, recipientPublicKeyBytes.Length);
+                if (senderPrivateKeyBytes != null) Array.Clear(senderPrivateKeyBytes, 0, senderPrivateKeyBytes.Length);
+                if (senderPublicKeyBytes != null) Array.Clear(senderPublicKeyBytes, 0, senderPublicKeyBytes.Length);
+                if (ephemeralPublicKeyBytes != null) Array.Clear(ephemeralPublicKeyBytes, 0, ephemeralPublicKeyBytes.Length);
+                if (sharedSecret != null) Array.Clear(sharedSecret, 0, sharedSecret.Length);
+                if (aesKey != null) Array.Clear(aesKey, 0, aesKey.Length);
+                if (gcmIv != null) Array.Clear(gcmIv, 0, gcmIv.Length);
+                if (gcmTag != null) Array.Clear(gcmTag, 0, gcmTag.Length);
+                if (cipherTextBytes != null) Array.Clear(cipherTextBytes, 0, cipherTextBytes.Length);
+                if (signatureBytes != null) Array.Clear(signatureBytes, 0, signatureBytes.Length);
+            }
+        }
         //V3加密
         static (string encryptedText, string debugInfo) EncryptTextV3(byte[] plaintextBytes, string recipientPublicKeyBase64)
         {
@@ -3319,256 +3667,309 @@ ooooooooooooo                           .     .oooooo.                          
             }
         }
 
-        static void DecryptInteractiveRouter(string encryptedText)
+        public static void DecryptInteractiveRouter(string encryptedText)
         {
-            Console.WriteLine("\n请选择解密方式:");
-            Console.WriteLine("1. 使用密码 (适用于 V0, V0.5, V1, V2 模式)");
-            Console.WriteLine("2. 使用私钥文件 (适用于 V3 模式)");
-            Console.Write("请输入选择 (1/2, 默认 1): ");
-            var choice = Console.ReadLine();
+            Console.WriteLine();
+            Console.WriteLine("=== 解密模式 ===");
+            Console.WriteLine("请选择解密方式:");
+            Console.WriteLine("  1. 使用密码 (V0/V0.5/V1/V2)");
+            Console.WriteLine("  2. 使用私钥文件 (V3/V3S)");
+            Console.WriteLine("  3. 遍历所有私钥文件尝试解密 (V3/V3S)");
+            Console.Write("请输入选择 (1/2/3，默认1): ");
+            var choice = Console.ReadLine()?.Trim();
 
-            byte[] decryptedBytes = null;
-            string debugInfo = null;
+            byte[] decryptedBytes = null; // 声明一次
+            string debugInfo = null;     // 声明一次
+                                         // 声明一个统一的签名状态变量，确保在所有路径中都有值
+            string effectiveSignatureStatus = "SKIPPED";
 
             try
             {
-                if (choice == "2")
+                if (choice == "2" || choice == "3")
                 {
-                    // V3 私钥解密
-                    Console.WriteLine($"当前工作目录: {Environment.CurrentDirectory}");
+                    // 私钥解密模式
+                    string[] privateKeyContents = null;
+                    bool tryAllKeys = choice == "3";
 
-                    // 扫描当前目录及其子目录下扩展名为 .pem 的文件
-                    string[] pemFiles = Directory.GetFiles(Environment.CurrentDirectory, "*.pem", SearchOption.AllDirectories);
-                    string privateKeyPath = null;
-
-                    if (pemFiles.Length == 0)
+                    if (tryAllKeys)
                     {
-                        // 没有 .pem 文件，直接提示输入路径
-                        Console.Write("\n未找到 .pem 文件，请输入私钥文件路径 (例如: my.private.pem): ");
-                        privateKeyPath = Console.ReadLine()?.Trim('"');
+                        var pemFiles = Directory.GetFiles(Environment.CurrentDirectory, "*.pem", SearchOption.AllDirectories);
+                        if (pemFiles.Length == 0)
+                        {
+                            Console.WriteLine("当前目录下未检测到任何 .pem 文件，取消操作。");
+                            return;
+                        }
+                        privateKeyContents = new string[pemFiles.Length];
+                        for (int i = 0; i < pemFiles.Length; i++)
+                        {
+                            privateKeyContents[i] = File.ReadAllText(pemFiles[i]).Trim();
+                        }
+                        Console.WriteLine($"检测到 {pemFiles.Length} 个 .pem 文件，将逐个尝试解密...");
                     }
                     else
                     {
-                        // 显示选择菜单
-                        Console.WriteLine("\n检测到的 .pem 文件：");
-                        for (int i = 0; i < pemFiles.Length; i++)
+                        // 选择单个私钥文件
+                        string privateKeyContent = SelectPrivateKeyFile();
+                        if (string.IsNullOrEmpty(privateKeyContent))
                         {
-                            string relativePath = Path.GetRelativePath(Environment.CurrentDirectory, pemFiles[i]);
-                            Console.WriteLine($"  {i + 1}. {relativePath}");
-                        }
-                        Console.WriteLine($"  {pemFiles.Length + 1}. 自定义路径");
-                        Console.WriteLine($"  {pemFiles.Length + 2}. 自动尝试所有私钥解密");
-
-                        // 提示用户选择
-                        Console.Write($"\n请输入选项编号 (1-{pemFiles.Length + 2}): ");
-                        if (!int.TryParse(Console.ReadLine(), out int pemChoice) || pemChoice < 1 || pemChoice > pemFiles.Length + 2)
-                        {
-                            Console.WriteLine("无效的选项，操作取消。");
+                            Console.WriteLine("私钥文件无效或未选择，取消操作。");
                             return;
                         }
+                        privateKeyContents = new[] { privateKeyContent };
+                    }
 
-                        if (pemChoice == pemFiles.Length + 1)
+                    // 尝试用每个私钥解密
+                    bool decryptionSuccessful = false;
+                    string[] actualPemFiles = tryAllKeys ? Directory.GetFiles(Environment.CurrentDirectory, "*.pem", SearchOption.AllDirectories) : new string[0];
+
+                    for (int i = 0; i < privateKeyContents.Length; i++)
+                    {
+                        string currentPrivateKeyContent = privateKeyContents[i];
+                        string currentPrivateKeyPathForDisplay = tryAllKeys ? Path.GetRelativePath(Environment.CurrentDirectory, actualPemFiles[i]) : "已选择的私钥";
+
+                        try
                         {
-                            // 自定义路径
-                            Console.Write("请输入私钥文件路径 (例如: my.private.pem): ");
-                            privateKeyPath = Console.ReadLine()?.Trim('"');
-                        }
-                        else if (pemChoice == pemFiles.Length + 2)
-                        {
-                            // 自动尝试所有私钥解密
-                            Console.Write("\n请输入私钥所在目录（按回车使用当前目录）: ");
-                            string tryDirectory = Console.ReadLine()?.Trim('"');
-                            if (string.IsNullOrWhiteSpace(tryDirectory))
+                            if (tryAllKeys)
                             {
-                                tryDirectory = Environment.CurrentDirectory;
+                                Console.WriteLine($"尝试使用私钥: {currentPrivateKeyPathForDisplay}");
+                            }
+
+                            // 尝试判断密文版本
+                            string version = TryDetectVersion(encryptedText, currentPrivateKeyContent);
+                            Console.WriteLine($"检测到密文版本: {version}");
+
+                            // 根据版本决定是否询问签名验证
+                            bool verifySignature = false;
+                            string signerPubBase64 = null;
+
+                            if (version == "3S")
+                            {
+                                // 只有V3S版本才询问签名验证
+                                Console.Write("是否验证签名？(y/n，默认n): ");
+                                verifySignature = Console.ReadLine()?.Trim().ToLower() == "y";
+
+                                if (verifySignature)
+                                {
+                                    signerPubBase64 = SelectPublicKeyFile();
+                                    if (string.IsNullOrEmpty(signerPubBase64))
+                                    {
+                                        Console.WriteLine("未选择公钥文件，跳过签名验证。");
+                                        verifySignature = false;
+                                    }
+                                }
+                            }
+
+                            if (version == "3S")
+                            {
+                                // 调用 V3S 解密，直接赋值给已声明的变量
+                                string tempSignatureStatus; // 临时变量来接收签名状态
+                                (decryptedBytes, debugInfo, tempSignatureStatus) = DecryptTextV3S(
+                                    encryptedText,
+                                    currentPrivateKeyContent,
+                                    verifySignature ? signerPubBase64 : null
+                                );
+                                effectiveSignatureStatus = tempSignatureStatus; // 将临时状态赋给统一的变量
+                            }
+                            else if (version == "3")
+                            {
+                                // 调用 V3 解密（假设 DecryptTextV3 支持 V3）
+                                (decryptedBytes, debugInfo) = DecryptTextV3(encryptedText, currentPrivateKeyContent);
+                                effectiveSignatureStatus = "SKIPPED"; // V3 模式无签名验证，确保状态一致
                             }
                             else
                             {
-                                tryDirectory = Path.GetFullPath(tryDirectory);
-                                if (!Directory.Exists(tryDirectory))
+                                throw new CryptographicException("无法识别的密文版本。");
+                            }
+
+                            // 解密成功
+                            decryptionSuccessful = true;
+                            Console.WriteLine($"√ 解密成功，使用私钥: {currentPrivateKeyPathForDisplay}");
+
+                            // 检查签名验证结果（仅 V3S） - 使用 effectiveSignatureStatus
+                            bool signatureValid = effectiveSignatureStatus == "VALID";
+                            bool signatureSkipped = effectiveSignatureStatus == "SKIPPED";
+                            bool signatureError = effectiveSignatureStatus == "ERROR";
+
+                            if (version == "3S" && verifySignature && signatureValid)
+                            {
+                                Console.ForegroundColor = ConsoleColor.Green;
+                                Console.WriteLine("√ 签名验证通过");
+                            }
+                            else if (version == "3S" && verifySignature && signatureError)
+                            {
+                                Console.ForegroundColor = ConsoleColor.Red;
+                                Console.WriteLine("× 签名验证错误");
+                            }
+                            else if (version == "3S" && verifySignature && !signatureValid && !signatureSkipped)
+                            {
+                                Console.ForegroundColor = ConsoleColor.Red;
+                                Console.WriteLine("× 签名验证失败");
+                            }
+                            else
+                            {
+                                Console.ForegroundColor = ConsoleColor.Yellow;
+                                Console.WriteLine(version == "3S" ? "!!! 未进行签名验证" : "!!! V3 模式无签名验证");
+                            }
+
+                            Console.WriteLine("解密结果:\n====================");
+                            string decryptedTextResult = string.Empty; // 使用新变量名以避免与方法参数混淆
+                            try
+                            {
+                                decryptedTextResult = Encoding.UTF8.GetString(decryptedBytes);
+                                if (string.IsNullOrEmpty(decryptedTextResult))
                                 {
-                                    Console.WriteLine("指定的目录不存在，操作取消。");
-                                    return;
+                                    Console.WriteLine("[DEBUG] 明文为空或不可打印");
+                                }
+                                else
+                                {
+                                    Console.WriteLine(decryptedTextResult);
                                 }
                             }
-
-                            Console.WriteLine($"\n正在 {tryDirectory} 中扫描 .pem 文件并尝试解密...");
-                            pemFiles = Directory.GetFiles(tryDirectory, "*.pem", SearchOption.AllDirectories);
-                            if (pemFiles.Length == 0)
+                            catch (Exception ex)
                             {
-                                Console.WriteLine("指定目录中未找到 .pem 文件，操作取消。");
-                                return;
+                                Console.WriteLine($"[DEBUG] 明文解码失败: {ex.Message}");
                             }
+                            Console.WriteLine("====================");
+                            Console.ResetColor();
 
-                            foreach (string pemFile in pemFiles)
-                            {
-                                string relativePath = Path.GetRelativePath(tryDirectory, pemFile);
-                                Console.WriteLine($"\n尝试使用私钥: {relativePath}");
-                                try
-                                {
-                                    string privateKeyBase64 = File.ReadAllText(pemFile).Trim();
-                                    Console.WriteLine("正在使用 V3 私钥解密，请稍候...");
-                                    (decryptedBytes, debugInfo) = DecryptTextV3(encryptedText, privateKeyBase64);
-                                    Console.WriteLine("解密成功！");
-                                    privateKeyPath = pemFile; // 记录成功解密的私钥路径
-                                    break; // 解密成功，退出循环
-                                }
-                                catch (Exception ex)
-                                {
-                                    Console.WriteLine($"使用 {relativePath} 解密失败: {ex.Message}");
-                                }
-                            }
+                            if (Program.DebugMode) // 假设 DebugMode 是 Program 类中的静态字段
+                                Console.WriteLine(debugInfo);
 
-                            if (privateKeyPath == null)
-                            {
-                                Console.WriteLine("\n所有私钥尝试失败，操作取消。");
-                                return;
-                            }
-                        }
-                        else
-                        {
-                            // 选择已有 .pem 文件
-                            privateKeyPath = pemFiles[pemChoice - 1];
-                            Console.WriteLine($"已选择文件: {Path.GetRelativePath(Environment.CurrentDirectory, privateKeyPath)}");
-                        }
-                    }
-
-                    // 验证路径（手动选择或自定义路径时）
-                    if (privateKeyPath != null && (string.IsNullOrWhiteSpace(privateKeyPath) || !File.Exists(privateKeyPath)))
-                    {
-                        Console.WriteLine("私钥文件路径无效或文件不存在，操作取消。");
-                        return;
-                    }
-
-                    // 如果尚未解密（非自动尝试模式）
-                    if (decryptedBytes == null)
-                    {
-                        privateKeyPath = Path.GetFullPath(privateKeyPath);
-                        try
-                        {
-                            string privateKeyBase64 = File.ReadAllText(privateKeyPath).Trim();
-                            Console.WriteLine("\n正在使用 V3 私钥解密，请稍候...");
-                            (decryptedBytes, debugInfo) = DecryptTextV3(encryptedText, privateKeyBase64);
+                            Console.WriteLine("按回车键继续...");
+                            Console.ReadLine();
+                            break; // 解密成功，退出循环
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"\nV3 解密失败: {ex.Message}");
-                            return;
+                            if (tryAllKeys)
+                            {
+                                Console.WriteLine($"  × 私钥无法解密此密文: {ex.Message}");
+                                continue; // 尝试下一个私钥
+                            }
+                            else
+                            {
+                                throw; // 单个私钥模式，直接抛出异常
+                            }
                         }
+                    }
+
+                    if (tryAllKeys && !decryptionSuccessful)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine("× 所有私钥都无法解密此密文。");
+                        Console.ResetColor();
+                        return;
                     }
                 }
                 else
                 {
-                    // 传统密码解密
-                    Console.Write("\n请输入密码: ");
-                    char[] password = ReadPassword();
-                    try
-                    {
-                        if (password == null || password.Length == 0)
-                        {
-                            Console.WriteLine("\n密码不能为空，操作已取消。");
-                            return;
-                        }
+                    // 密码模式解密 (默认)
+                    Console.Write("请输入密码: ");
+                    var pwd = ReadPassword();
+                    Console.WriteLine("正在解密...");
+                    (decryptedBytes, debugInfo) = DecryptText(encryptedText, pwd);
+                    Array.Clear(pwd, 0, pwd.Length); // 清除敏感信息
 
-                        Console.WriteLine("\n正在解密，这可能需要一些时间，请稍候...");
-                        (decryptedBytes, debugInfo) = DecryptText(encryptedText, password);
-                    }
-                    finally
-                    {
-                        if (password != null) Array.Clear(password, 0, password.Length);
-                    }
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine("√ 解密完成，结果:");
+                    Console.WriteLine(Encoding.UTF8.GetString(decryptedBytes));
+                    Console.ResetColor();
+
+                    if (Program.DebugMode) // 假设 DebugMode 是 Program 类中的静态字段
+                        Console.WriteLine(debugInfo);
+
+                    Console.WriteLine("按回车键继续...");
+                    Console.ReadLine();
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"\n解密失败: {ex.Message}");
-                if (DebugMode && ex.InnerException != null)
-                {
-                    Console.WriteLine($"内部错误: {ex.InnerException.Message}");
-                }
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"解密失败: {ex.Message}");
+                Console.ResetColor();
                 return;
-            }
-
-            char[] decryptedChars = Encoding.UTF8.GetChars(decryptedBytes);
-            try
-            {
-                Console.WriteLine("\n√ 解密成功");
-
-                if (DebugMode)
-                {
-                    Console.WriteLine("\n调试信息 (解密参数):");
-                    Console.WriteLine(debugInfo);
-                }
-
-                Console.WriteLine("\n解密结果输出方式:");
-                Console.WriteLine("1. 直接显示");
-                Console.WriteLine("2. 保存到文件");
-                Console.WriteLine("3. 同时显示并保存到文件");
-                Console.Write("请选择 (1-3): ");
-
-                var outputChoice = Console.ReadLine();
-
-                string outputFilePath = null;
-                if (outputChoice == "2" || outputChoice == "3")
-                {
-                    Console.Write("请输入保存文件的路径: ");
-                    outputFilePath = Console.ReadLine();
-                }
-
-                switch (outputChoice)
-                {
-                    case "1":
-                        Console.WriteLine($"\n解密结果:\n==========================================================\n{new string(decryptedChars)}");
-                        Console.WriteLine("\n==========================================================\nTextCrypt 不对用户解密结果的内容承担任何责任，解密结果完全基于用户提供的输入和操作\n按下回车返回主菜单");
-                        Console.ReadLine();
-                        break;
-                    case "2":
-                        if (!string.IsNullOrEmpty(outputFilePath))
-                        {
-                            try
-                            {
-                                File.WriteAllText(outputFilePath, new string(decryptedChars));
-                                Console.WriteLine($"\n解密结果已保存到: {outputFilePath}");
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"保存文件失败: {ex.Message}");
-                            }
-                        }
-                        else
-                        {
-                            Console.WriteLine("未提供文件路径，操作取消。");
-                        }
-                        break;
-                    case "3":
-                        Console.WriteLine($"\n解密结果:\n{new string(decryptedChars)}");
-                        if (!string.IsNullOrEmpty(outputFilePath))
-                        {
-                            try
-                            {
-                                File.WriteAllText(outputFilePath, new string(decryptedChars));
-                                Console.WriteLine($"\n解密结果已保存到: {outputFilePath}");
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"保存文件失败: {ex.Message}");
-                            }
-                        }
-                        else
-                        {
-                            Console.WriteLine("未提供文件路径，仅显示结果。");
-                        }
-                        break;
-                    default:
-                        Console.WriteLine($"\n无效的选择，将直接显示结果:\n{new string(decryptedChars)}");
-                        break;
-                }
             }
             finally
             {
-                Array.Clear(decryptedChars, 0, decryptedChars.Length);
-                Array.Clear(decryptedBytes, 0, decryptedBytes.Length);
+                if (decryptedBytes != null)
+                    Array.Clear(decryptedBytes, 0, decryptedBytes.Length); // 清除敏感信息
             }
+        }
+
+        private static string TryDetectVersion(string encryptedText, string privateKeyBase64)
+        {
+            try
+            {
+                // 清理私钥
+                privateKeyBase64 = privateKeyBase64
+                    .Replace("-----BEGIN PRIVATE KEY-----", "")
+                    .Replace("-----END PRIVATE KEY-----", "")
+                    .Replace("\n", "")
+                    .Replace("\r", "")
+                    .Trim();
+
+                // 派生公钥
+                byte[] privateKeyBytes = Convert.FromBase64String(privateKeyBase64);
+                using var ecdh = ECDiffieHellman.Create();
+                ecdh.ImportPkcs8PrivateKey(privateKeyBytes, out _);
+                byte[] derivedPublicKeyBytes = ecdh.ExportSubjectPublicKeyInfo();
+                string derivedPublicKeyBase64 = Convert.ToBase64String(derivedPublicKeyBytes);
+
+                // 尝试 V3S 解码
+                try
+                {
+                    var (shuffledCharset, charToValueMap, customBase) = GeneratePasswordDerivedCharset(derivedPublicKeyBase64);
+                    byte[] decodedJsonBytes = PasswordDerivedBaseStringToBytes(
+                        encryptedText,
+                        shuffledCharset,
+                        charToValueMap,
+                        customBase);
+                    string jsonString = Encoding.UTF8.GetString(decodedJsonBytes);
+                    var envelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString);
+                    if (envelope?.V == "3S")
+                        return "3S";
+                    if (envelope?.V == "3")
+                        return "3";
+                }
+                catch
+                {
+                    // V3S 解码失败，尝试 V3（假设 V3 使用标准 Base64）
+                    try
+                    {
+                        byte[] decodedBytes = Convert.FromBase64String(encryptedText);
+                        string jsonString = Encoding.UTF8.GetString(decodedBytes);
+                        var envelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString);
+                        if (envelope?.V == "3")
+                            return "3";
+                    }
+                    catch
+                    {
+                        // 无法识别
+                    }
+                }
+            }
+            catch
+            {
+                // 私钥无效或解码失败
+            }
+            return "UNKNOWN";
+        }
+
+
+
+
+        public static byte[] Combine(params byte[][] arrays)
+        {
+            // 计算总长度
+            int totalLength = arrays.Sum(a => a.Length);
+            var result = new byte[totalLength];
+            int offset = 0;
+            foreach (var arr in arrays)
+            {
+                Buffer.BlockCopy(arr, 0, result, offset, arr.Length);
+                offset += arr.Length;
+            }
+            return result;
         }
 
         static (byte[] decryptedBytes, string debugInfo) DecryptTextV3(string encryptedCustomBaseString, string privateKeyBase64)
@@ -3664,6 +4065,183 @@ ooooooooooooo                           .     .oooooo.                          
                 if (gcmIv != null) Array.Clear(gcmIv, 0, gcmIv.Length);
                 if (gcmTag != null) Array.Clear(gcmTag, 0, gcmTag.Length);
                 if (cipherTextBytes != null) Array.Clear(cipherTextBytes, 0, cipherTextBytes.Length);
+            }
+        }
+
+        static (byte[] decryptedBytes, string debugInfo, string signatureStatus) DecryptTextV3S(
+    string encryptedCustomBaseString,
+    string privateKeyBase64,
+    string senderPublicKeyBase64 = null)
+        {
+            byte[] privateKeyBytes = null;
+            byte[] senderPublicKeyBytes = null;
+            byte[] derivedPublicKeyBytes = null;
+            byte[] decodedJsonBytes = null;
+            byte[] ephemeralPublicKeyBytes = null;
+            byte[] sharedSecret = null;
+            byte[] aesKey = null;
+            byte[] gcmIv = null;
+            byte[] gcmTag = null;
+            byte[] cipherTextBytes = null;
+            byte[] decryptedBytes = null;
+            bool canVerifySignature = false;
+            bool isSignatureValid = false;
+            string signatureStatus = "SKIPPED";
+            string debugSignatureError = string.Empty;
+
+            try
+            {
+                privateKeyBase64 = privateKeyBase64
+                    .Replace("-----BEGIN PRIVATE KEY-----", "")
+                    .Replace("-----END PRIVATE KEY-----", "")
+                    .Replace("\n", "")
+                    .Replace("\r", "")
+                    .Trim();
+
+                if (!string.IsNullOrEmpty(senderPublicKeyBase64))
+                {
+                    senderPublicKeyBase64 = senderPublicKeyBase64
+                        .Replace("-----BEGIN PUBLIC KEY-----", "")
+                        .Replace("-----END PUBLIC KEY-----", "")
+                        .Replace("\n", "")
+                        .Replace("\r", "")
+                        .Trim();
+                    senderPublicKeyBytes = Convert.FromBase64String(senderPublicKeyBase64);
+                    canVerifySignature = true;
+                }
+
+                // 1. 派生公钥
+                privateKeyBytes = Convert.FromBase64String(privateKeyBase64);
+                using var ecdh = ECDiffieHellman.Create();
+                ecdh.ImportPkcs8PrivateKey(privateKeyBytes, out _);
+                derivedPublicKeyBytes = ecdh.ExportSubjectPublicKeyInfo();
+                string derivedPublicKeyBase64 = Convert.ToBase64String(derivedPublicKeyBytes);
+
+                // 2. 解码密文
+                var (shuffledCharset, charToValueMap, customBase) = GeneratePasswordDerivedCharset(derivedPublicKeyBase64);
+                decodedJsonBytes = PasswordDerivedBaseStringToBytes(
+                    encryptedCustomBaseString,
+                    shuffledCharset,
+                    charToValueMap,
+                    customBase);
+
+                // 3. 解析 JSON
+                string jsonString = Encoding.UTF8.GetString(decodedJsonBytes);
+                var envelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString);
+
+                if (envelope?.V != "3S")
+                    throw new CryptographicException("密文不是有效的 V3S 格式，或者用于解码的私钥不正确。");
+
+                // 4. 提取数据
+                ephemeralPublicKeyBytes = Convert.FromBase64String(envelope.EK);
+                gcmIv = Convert.FromBase64String(envelope.I);
+                gcmTag = Convert.FromBase64String(envelope.T);
+                cipherTextBytes = Convert.FromBase64String(envelope.C);
+                byte[] signatureBytes = Convert.FromBase64String(envelope.Sig);
+
+                // 5. 验证签名 - 使用更稳健的方法
+                if (canVerifySignature)
+                {
+                    try
+                    {
+                        // 修复：使用 Program.Combine 确保数据拼接一致性
+                        byte[] verificationData = Program.Combine(cipherTextBytes, gcmTag, gcmIv);
+
+                        using var senderEcdsa = ECDsa.Create();
+                        senderEcdsa.ImportSubjectPublicKeyInfo(senderPublicKeyBytes, out _);
+
+                        // 执行签名验证
+                        isSignatureValid = senderEcdsa.VerifyData(verificationData, signatureBytes, HashAlgorithmName.SHA512);
+                        signatureStatus = isSignatureValid ? "VALID" : "INVALID";
+
+                        // 立即清理验证数据
+                        Array.Clear(verificationData, 0, verificationData.Length);
+                    }
+                    catch (Exception ex)
+                    {
+                        isSignatureValid = false;
+                        signatureStatus = "ERROR";
+                        debugSignatureError = ex.Message;
+                    }
+                }
+
+                // 6. 导入临时公钥
+                using var ephemeralPublicKey = ECDiffieHellman.Create();
+                ephemeralPublicKey.ImportSubjectPublicKeyInfo(ephemeralPublicKeyBytes, out _);
+
+                // 7. 派生共享密钥
+                sharedSecret = ecdh.DeriveKeyFromHash(
+                    ephemeralPublicKey.PublicKey,
+                    HashAlgorithmName.SHA512);
+
+                // 8. 派生 AES 密钥
+                aesKey = HKDF.DeriveKey(
+                    HashAlgorithmName.SHA512,
+                    sharedSecret,
+                    32,
+                    null,
+                    Encoding.UTF8.GetBytes("TextCryptV3S-AES256GCM"));
+
+                // 9. AES-GCM 解密
+                decryptedBytes = new byte[cipherTextBytes.Length];
+                try
+                {
+                    using (var aesGcm = new AesGcm(aesKey))
+                    {
+                        aesGcm.Decrypt(gcmIv, cipherTextBytes, gcmTag, decryptedBytes, null);
+                    }
+                }
+                catch (CryptographicException ex)
+                {
+                    throw new CryptographicException($"AES-GCM 解密失败，可能是密文或密钥错误: {ex.Message}", ex);
+                }
+
+                // 构建调试信息
+                string debugInfo = DebugMode
+                    ? $@"解密参数 (非对称加密 V3S):
+- Private Key (Base64): {privateKeyBase64}
+- Derived Public Key (Base64): {derivedPublicKeyBase64}
+- Sender Public Key (Base64): {senderPublicKeyBase64 ?? "Not provided"}
+- JSON Content: {jsonString}
+- Ephemeral Public Key (Base64): {envelope.EK}
+- AES-GCM IV (Base64): {envelope.I}
+- AES-GCM Tag (Base64): {envelope.T}
+- Ciphertext (Base64): {envelope.C}
+- Signature (ECDSA SHA512, Base64): {envelope.Sig}
+- Signature Verification: {signatureStatus}{(debugSignatureError != string.Empty ? $" (Error: {debugSignatureError})" : "")}
+- Shared Secret (SHA512, Base64): {Convert.ToBase64String(sharedSecret)}
+- Derived AES Key (HKDF, Base64): {Convert.ToBase64String(aesKey)}
+- Decrypted Bytes Length: {decryptedBytes.Length}
+- Decrypted Bytes (Hex): {BitConverter.ToString(decryptedBytes).Replace("-", "")}
+- Custom Encoding Charset derived from: Own Public Key (derived from private key)"
+                    : string.Empty;
+
+                // 返回前复制 decryptedBytes，防止被清零
+                byte[] resultBytes = new byte[decryptedBytes.Length];
+                Buffer.BlockCopy(decryptedBytes, 0, resultBytes, 0, decryptedBytes.Length);
+                return (resultBytes, debugInfo, signatureStatus);
+            }
+            catch (Exception ex) when (ex is FormatException || ex is JsonException)
+            {
+                throw new CryptographicException("密文格式无效或已损坏，或者用于解码的私钥不正确。", ex);
+            }
+            catch (CryptographicException ex)
+            {
+                throw new CryptographicException($"V3S 解密失败，请检查私钥是否正确以及密文是否完整。 {ex.Message}", ex);
+            }
+            finally
+            {
+                if (privateKeyBytes != null) Array.Clear(privateKeyBytes, 0, privateKeyBytes.Length);
+                if (senderPublicKeyBytes != null) Array.Clear(senderPublicKeyBytes, 0, senderPublicKeyBytes.Length);
+                if (derivedPublicKeyBytes != null) Array.Clear(derivedPublicKeyBytes, 0, derivedPublicKeyBytes.Length);
+                if (decodedJsonBytes != null) Array.Clear(decodedJsonBytes, 0, decodedJsonBytes.Length);
+                if (ephemeralPublicKeyBytes != null) Array.Clear(ephemeralPublicKeyBytes, 0, ephemeralPublicKeyBytes.Length);
+                if (sharedSecret != null) Array.Clear(sharedSecret, 0, sharedSecret.Length);
+                if (aesKey != null) Array.Clear(aesKey, 0, aesKey.Length);
+                if (gcmIv != null) Array.Clear(gcmIv, 0, gcmIv.Length);
+                if (gcmTag != null) Array.Clear(gcmTag, 0, gcmTag.Length);
+                if (cipherTextBytes != null) Array.Clear(cipherTextBytes, 0, cipherTextBytes.Length);
+                if (decryptedBytes != null) Array.Clear(decryptedBytes, 0, decryptedBytes.Length);
             }
         }
 
