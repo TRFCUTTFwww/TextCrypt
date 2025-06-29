@@ -4090,7 +4090,7 @@ ooooooooooooo                           .     .oooooo.                          
                                 Console.WriteLine(version == "3S" ? "!!! 未进行签名验证" : "!!! V3 模式无签名验证");
                             }
 
-                            Console.WriteLine("解密结果:\n====================");
+                            Console.WriteLine("解密结果:\n========================================");
                             string decryptedTextResult = string.Empty; // 使用新变量名以避免与方法参数混淆
                             try
                             {
@@ -4108,7 +4108,7 @@ ooooooooooooo                           .     .oooooo.                          
                             {
                                 Console.WriteLine($"[DEBUG] 明文解码失败: {ex.Message}");
                             }
-                            Console.WriteLine("====================");
+                            Console.WriteLine("========================================");
                             Console.ResetColor();
 
                             if (Program.DebugMode) // 假设 DebugMode 是 Program 类中的静态字段
@@ -4150,8 +4150,9 @@ ooooooooooooo                           .     .oooooo.                          
                     Array.Clear(pwd, 0, pwd.Length); // 清除敏感信息
 
                     Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine("√ 解密完成，结果:");
+                    Console.WriteLine("[√ Success] 解密完成，结果:\n========================================");
                     Console.WriteLine(Encoding.UTF8.GetString(decryptedBytes));
+                    Console.WriteLine("========================================");
                     Console.ResetColor();
 
                     if (Program.DebugMode) // 假设 DebugMode 是 Program 类中的静态字段
