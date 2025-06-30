@@ -54,12 +54,11 @@ namespace TextCrypt
 
             public static EnvelopeData ParseHeader(string encryptedText, string recipientPublicKeyBase64)
             {
-                // 调用你们已有的 GeneratePasswordDerivedCharset & PasswordDerivedBaseStringToBytes
-                var (shuffledCharset, charToValueMap, customBase) =
-                    Program.GeneratePasswordDerivedCharset(recipientPublicKeyBase64);
-
+                /* ① 直接把 publicKey 当成“口令”丢进去 —— 
+                   new + old + 极旧 全部可自动探测 */
                 byte[] jsonBytes = Program.PasswordDerivedBaseStringToBytes(
-                    encryptedText, shuffledCharset, charToValueMap, customBase);
+                                       encryptedText,
+                                       recipientPublicKeyBase64);
 
                 string json = Encoding.UTF8.GetString(jsonBytes);
                 return JsonSerializer.Deserialize<EnvelopeData>(json);
@@ -72,6 +71,7 @@ namespace TextCrypt
             /// External nonce 的字节数（可设 0 – 任意正整数）
             /// </summary>
             public static int NonceLength = 8;
+            public static string Base = "B1";
         }
 
         public enum PanelMode { Encrypt, Decrypt }
@@ -110,7 +110,7 @@ namespace TextCrypt
             // 历史记录
             public bool EnableHistory { get; set; } = true;
             public List<string> HistoryPaths { get; set; } = new List<string>();
-
+            public string BaseEncoding { get; set; } = "B1";
             // 旧字段：若不再使用可删除
             [JsonIgnore]              // ← 避免序列化干扰
             public bool UseNewEncodingWithSalt { get; set; } = true;
@@ -137,7 +137,7 @@ namespace TextCrypt
 
                     // 同步编码方式设置到全局变量
                     UseNewEncodingWithSalt = config.UseNewEncodingWithSalt;
-
+                    TextCryptConfig.Base = config.BaseEncoding;
                     return config;
                 }
                 catch
@@ -161,7 +161,7 @@ namespace TextCrypt
 
                 // 同步编码方式设置到全局变量
                 UseNewEncodingWithSalt = defaultConfig.UseNewEncodingWithSalt;
-
+                TextCryptConfig.Base = defaultConfig.BaseEncoding;
                 return defaultConfig;
             }
         }
@@ -172,7 +172,7 @@ namespace TextCrypt
             {
                 // 同步全局变量到配置
                 CurrentConfig.UseNewEncodingWithSalt = UseNewEncodingWithSalt;
-
+                CurrentConfig.BaseEncoding = TextCryptConfig.Base;
                 File.WriteAllText(ConfigPath, JsonSerializer.Serialize(CurrentConfig, new JsonSerializerOptions { WriteIndented = true }));
             }
             catch
@@ -328,11 +328,17 @@ namespace TextCrypt
          *  PUBLIC DECODE API (legacy signature retained)
          * ----------------------------------------------------------------*/
 
+        /// <summary>
+        /// 兼容所有旧版（V0~V2）Base-N 编码的还原函数：
+        /// ① 首先用“口令 → SHA-512 → 洗牌字符集”
+        ///    调用 DecodeInternal_Old()（其内部自动处理分块或单块）
+        /// ② 若①失败，再把 password 本身当字符集兜底
+        /// </summary>
         public static byte[] PasswordDerivedBaseStringToBytes(
-    string encoded,
-    string secondParam,
-    Dictionary<char, int>? map = null,
-    int customBase = 0)
+string encoded,
+string secondParam,
+Dictionary<char, int>? map = null,
+int customBase = 0)
         {
             if (encoded == null) return null;
             if (secondParam == null) throw new ArgumentNullException(nameof(secondParam));
@@ -353,18 +359,57 @@ namespace TextCrypt
 
             try
             {
-                // 1. 由口令派生字符集
-                var (shuffledCharset, cmap, derivedBase) =
-                    GeneratePasswordDerivedCharset(password);
-
-                // 2. 解码
-                return DecodeInternal_Old(encoded, shuffledCharset, cmap, derivedBase);
+                var (shuffled, cmap, baseN) = GeneratePasswordDerivedCharset(password);
+                return DecodeInternal_Old(encoded, shuffled, cmap, baseN);   // 仍可能抛错
             }
-            catch (Exception ex)
+            catch                                                  // --- NEW
             {
-                throw new FormatException("Failed to decode new-format string.", ex);
+                /* ---------- ② 任意异常 → 纯单块回退 ---------- */
+                var (shuffled, cmap, baseN) = GeneratePasswordDerivedCharset(password);
+                return DecodeChunkWithOriginalAlgorithm(encoded, shuffled, cmap, baseN);
             }
         }
+
+
+        private static byte[] DecodeChunkWithOriginalAlgorithm(
+    string encoded,
+    string shuffledCharset,
+    int customBase)            // 建议直接传 shuffledCharset.Length
+        {
+            if (encoded == null) return null;
+            if (encoded.Length == 0) return Array.Empty<byte>();
+
+            // ① 数前导零字符（字符集首位）
+            int leadingZeros = 0;
+            while (leadingZeros < encoded.Length &&
+                   encoded[leadingZeros] == shuffledCharset[0])
+                leadingZeros++;
+
+            // ② 把 N 进制字符串还原成 BigInteger
+            BigInteger num = BigInteger.Zero;
+            foreach (char c in encoded)
+            {
+                int digit = shuffledCharset.IndexOf(c);
+                if (digit < 0)
+                    throw new FormatException($"非法字符 '{c}' 不在字符集里。");
+                num = num * customBase + digit;
+            }
+
+            // ③ BigInteger → byte[]（小端），然后翻过来
+            byte[] little = num.ToByteArray();     // 包含刚才人为塞的 0x00
+            Array.Reverse(little);
+
+            // ④ 去掉头部那一枚 0x00
+            int skip = 0;
+            if (little.Length > 0 && little[0] == 0x00) skip = 1;
+
+            // ⑤ 把前导零补回来
+            var result = new byte[leadingZeros + little.Length - skip];
+            Buffer.BlockCopy(little, skip, result, leadingZeros, little.Length - skip);
+            // 前 leadingZeros 个字节已经是 0x00，直接返回
+            return result;
+        }
+
 
         // 旧签名：无 charMap
         public static byte[] PasswordDerivedBaseStringToBytes(
@@ -383,6 +428,33 @@ namespace TextCrypt
         /* -----------------------------------------------------------------
          *  PRIVATE HELPERS: encoding / decoding wrapper around old core
          * ----------------------------------------------------------------*/
+        public static byte[] PasswordDerivedBaseStringToBytes(string encoded, string second)
+        {
+            if (encoded == null) return null;
+            if (second == null) throw new ArgumentNullException(nameof(second));
+
+            /* ---------- A) 把 second 当作 password，走新算法 ---------- */
+            try
+            {
+                var (pwdCharset, pwdMap, pwdBase) = GeneratePasswordDerivedCharset(second);
+                var rawPwd = DecodeInternal_Old(encoded, pwdCharset, pwdMap, pwdBase);
+                if (LooksLikeJson(rawPwd))          // 新算法成功，直接返回
+                    return rawPwd;
+            }
+            catch
+            {
+                /* 忽略，转走单块解码 */
+            }
+
+            /* ---------- B) 新策略：跳过 DecodeInternal_Old ---------- */
+            // 这里把 second 当作字符集，直接用单块原算法解码
+            string charset = second;
+            int baseN = charset.Length;
+
+            // ★ 若需要 charMap 版，请改用四参重载（带 map），效果等价
+            return DecodeChunkWithOriginalAlgorithm(encoded, charset, baseN);
+        }
+
 
         private static string EncodeInternal_Old(byte[] data, string shuffledCharset, int customBase)
         {
@@ -420,7 +492,9 @@ namespace TextCrypt
             int customBase)
         {
             byte[] decoded = DecodeWithChunking(encoded, shuffledCharset, map, customBase);
-
+            int digitsPerFull = ComputeDigitsPerChunk(customBase);
+            if (encoded.Length <= digitsPerFull)
+                return DecodeChunkWithOriginalAlgorithm(encoded, shuffledCharset, map, customBase);
             try
             {
                 int idx = Array.IndexOf(decoded, (byte)'{');
@@ -452,38 +526,52 @@ namespace TextCrypt
             return map;
         }
 
-        private static string GenerateRandomSalt()
-        {
-            var bytes = new byte[SALT_LENGTH];
-            RandomNumberGenerator.Fill(bytes);
-
-            var sb = new StringBuilder(SALT_LENGTH);
-            foreach (var b in bytes)
-                sb.Append(SALT_ALPHABET[b % SALT_ALPHABET.Length]);
-
-            return sb.ToString();
-        }
 
         private static byte[] DecodeWithChunking(
-    string encoded, string shuffledCharset, Dictionary<char, int> map, int customBase)
+    string encoded, string shuffled, Dictionary<char, int> map, int baseN)
         {
-            int digitsPerFull = ComputeDigitsPerChunk(customBase);
+            int digitsPerFull = ComputeDigitsPerChunk(baseN);
             var result = new List<byte>();
             int pos = 0;
+
             while (pos + digitsPerFull <= encoded.Length)
             {
-                string slice = encoded.Substring(pos, digitsPerFull).TrimStart(shuffledCharset[0]);
-                if (slice.Length == 0)
+                string chunkStr = encoded.Substring(pos, digitsPerFull);
+
+                /* ---- A) 快速判定：全 0 ---- */
+                if (chunkStr.TrimStart(shuffled[0]).Length == 0)
+                {
                     result.AddRange(new byte[CHUNK_SIZE]);
+                }
                 else
-                    result.AddRange(DecodeChunkWithOriginalAlgorithm(slice, shuffledCharset, map, customBase));
+                {
+                    /* ---- B) 完整解码，不 Trim ---- */
+                    byte[] raw = DecodeChunkWithOriginalAlgorithm(chunkStr, shuffled, map, baseN);
+
+                    /* ---- C) 64 B 对齐 ---- */
+                    if (raw.Length < CHUNK_SIZE)
+                    {
+                        var tmp = new byte[CHUNK_SIZE];
+                        Buffer.BlockCopy(raw, 0, tmp, CHUNK_SIZE - raw.Length, raw.Length);
+                        raw = tmp;
+                    }
+                    else if (raw.Length > CHUNK_SIZE)
+                    {
+                        raw = raw[^CHUNK_SIZE..];          // 取末尾 64 B
+                    }
+                    result.AddRange(raw);
+                }
                 pos += digitsPerFull;
             }
+
+            /* 收尾：剩余不足 64 B 的末块单独解码 */
             if (pos < encoded.Length)
-                result.AddRange(DecodeChunkWithOriginalAlgorithm(encoded.Substring(pos), shuffledCharset, map, customBase));
+                result.AddRange(DecodeChunkWithOriginalAlgorithm(
+                                    encoded.Substring(pos), shuffled, map, baseN));
 
             return result.ToArray();
         }
+
         // 以下保留你现有的单块原算法，不动
         private static string EncodeChunkWithOriginalAlgorithm(byte[] data, string shuffledCharset, int customBase)
         {
@@ -513,6 +601,9 @@ namespace TextCrypt
             {
                 sb.Insert(0, new string(shuffledCharset[0], leadingZeros));
             }
+            // ↓ 只加这三行，不改逻辑
+            
+
             return sb.ToString();
         }
 
@@ -559,8 +650,40 @@ namespace TextCrypt
             }
             return finalResult;
         }
+        private static bool LooksLikeJson(byte[] bytes)
+        {
+            // 找第一个 '{'
+            int brace = Array.IndexOf(bytes, (byte)'{');
+            if (brace < 0) return false;
 
+            try
+            {
+                var reader = new Utf8JsonReader(bytes.AsSpan(brace),
+                                                isFinalBlock: true, state: default);
+                return reader.Read() && reader.TokenType == JsonTokenType.StartObject;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+        private static bool HasEnvelopeVersion(ReadOnlySpan<byte> data, out int jsonStart)
+        {
+            jsonStart = -1;
 
+            // 先找到第一个 '{'
+            int brace = data.IndexOf((byte)'{');
+            if (brace < 0) return false;
+
+            jsonStart = brace;
+            var reader = new Utf8JsonReader(data.Slice(brace), isFinalBlock: true, state: default);
+
+            // 读取根对象的第一个属性即可
+            if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject) return false;
+            if (!reader.Read() || reader.TokenType != JsonTokenType.PropertyName) return false;
+
+            return reader.ValueTextEquals("V");
+        }
 
         static void Main(string[] args)
         {
@@ -2101,9 +2224,10 @@ ooooooooooooo                           .     .oooooo.                          
                             Console.Write("\n编辑完成？ (y - 完成并继续 / r - 重新编辑 / c - 取消操作): ");
                             string confirmation = Console.ReadLine()?.ToLower();
 
-                            if (confirmation == "y")
+                            if (confirmation == "c")
                             {
-                                editingConfirmed = true;
+                                Console.WriteLine("操作已取消。");
+                                return;
                             }
                             else if (confirmation == "r")
                             {
@@ -2111,8 +2235,8 @@ ooooooooooooo                           .     .oooooo.                          
                             }
                             else
                             {
-                                Console.WriteLine("操作已取消。");
-                                return;
+                                
+                                editingConfirmed = true;
                             }
                         }
 
@@ -2564,7 +2688,19 @@ ooooooooooooo                           .     .oooooo.                          
                 Buffer.BlockCopy(jsonBytes, 0, toEncode, extNonce.Length, jsonBytes.Length);
                 // 9. 使用接收方公钥作为"密码"进行自定义编码
                 var (shuffledCharset, _, customBase) = GeneratePasswordDerivedCharset(recipientPublicKeyBase64);
-                string encryptedText = BytesToPasswordDerivedBaseString(toEncode, shuffledCharset, customBase);
+                string encryptedText;
+                if (TextCryptConfig.Base == "B1")
+                {
+                    encryptedText = EncodeChunkWithOriginalAlgorithm(jsonBytes, shuffledCharset,
+                                                                 customBase);
+                }
+                else
+                {
+                    encryptedText = BytesToPasswordDerivedBaseString(toEncode,
+                                                                     shuffledCharset,
+                                                                     customBase);
+
+                }
 
 
                 string debugInfo = DebugMode ? $@"加密参数 (非对称加密 V3S):
@@ -2781,7 +2917,18 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                         Buffer.BlockCopy(nonceForV1, 0, finalBytesToEncode, 0, nonceForV1.Length);
                         Buffer.BlockCopy(jsonBytes, 0, finalBytesToEncode, nonceForV1.Length, jsonBytes.Length);
 
-                        encryptedText = BytesToPasswordDerivedBaseString(finalBytesToEncode, shuffledCharset, customBase);
+                        if (TextCryptConfig.Base == "B1")
+                        {
+                            encryptedText = EncodeChunkWithOriginalAlgorithm(jsonBytes, shuffledCharset,
+                                                                         customBase);
+                        }
+                        else
+                        {
+                            encryptedText = BytesToPasswordDerivedBaseString(jsonBytes,
+                                                                             shuffledCharset,
+                                                                             customBase);
+
+                        }
 
                         debugInfo = DebugMode ? $@"加密参数 (双层加密 V1):
 - DEK (Base64): {Convert.ToBase64String(dek)} (Intermediate, not stored directly)
@@ -2861,10 +3008,31 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                         Buffer.BlockCopy(extNonce, 0, toEncode, 0, extNonce.Length);
                         Buffer.BlockCopy(jsonBytes, 0, toEncode, extNonce.Length, jsonBytes.Length);
 
-                        /* ---------- 5. 62 进制编码 ---------- */
-                        encryptedText = BytesToPasswordDerivedBaseString(toEncode,
-                                                                         shuffledCharset,
+                        if(TextCryptConfig.Base == "B1")
+                        {
+                            encryptedText = EncodeChunkWithOriginalAlgorithm(jsonBytes, shuffledCharset,
                                                                          customBase);
+                            if(DebugMode)
+                            { // ↓ 只加这三行，不改逻辑
+                                Console.WriteLine($"[DEBUG]   口令:  {passwordStr}");
+                                Console.WriteLine($"[DEBUG] 字符集首: {shuffledCharset[0]}  (len={shuffledCharset.Length})");
+                                Console.WriteLine($"[DEBUG]   密文前32字: {encryptedText[..Math.Min(32, encryptedText.Length)]}");
+                            }
+                        }
+                        else
+                        {
+                            encryptedText = BytesToPasswordDerivedBaseString(toEncode,
+                                                                             shuffledCharset,
+                                                                             customBase);
+                            if (DebugMode)
+                            { // ↓ 只加这三行，不改逻辑
+                                Console.WriteLine($"[DEBUG]   口令:  {passwordStr}");
+                                Console.WriteLine($"[DEBUG] 字符集首: {shuffledCharset[0]}  (len={shuffledCharset.Length})");
+                                Console.WriteLine($"[DEBUG]   密文前32字: {encryptedText[..Math.Min(32, encryptedText.Length)]}");
+                            }
+
+                        }
+                        /* ---------- 5. 62 进制编码 ---------- */
 
                         /* ---------- 6. 调试信息 ---------- */
                         debugInfo = DebugMode ? $@"加密参数 (直接加密 V2)：
@@ -2981,6 +3149,11 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                 if (kek != null) Array.Clear(kek, 0, kek.Length);
                 if (salt != null) Array.Clear(salt, 0, salt.Length);
                 if (cipherTextBytes != null) Array.Clear(cipherTextBytes, 0, cipherTextBytes.Length);
+            }
+            // ↓ 只加这三行，不改逻辑
+            if(DebugMode)
+            {
+                Console.WriteLine($"当前编码模式：{TextCryptConfig.Base}");
             }
 
             return (encryptedText, debugInfo);
@@ -5001,7 +5174,12 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
             {
                 string passwordStr = new string(password);
                 var (shuffledCharset, charToValueMap, customBase) = GeneratePasswordDerivedCharset(passwordStr);
-
+                if (DebugMode)
+                { // ↓ 只加这三行，不改逻辑
+                    Console.WriteLine($"[DEBUG]   口令:  {passwordStr}");
+                    Console.WriteLine($"[DEBUG] 字符集首: {shuffledCharset[0]}  (len={shuffledCharset.Length})");
+                    //Console.WriteLine($"[DEBUG]   密文前32字: {encryptedText[..Math.Min(32, encryptedText.Length)]}");
+                }
                 try
                 {
                     decodedBytes = PasswordDerivedBaseStringToBytes(encryptedCustomBaseString, shuffledCharset, charToValueMap, customBase);
@@ -5009,6 +5187,12 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                 catch (FormatException ex)
                 {
                     throw new Exception("密文格式无效或密码不正确 (自定义编码解码失败)。", ex);
+                    if (DebugMode)
+                    { // ↓ 只加这三行，不改逻辑
+                        Console.WriteLine($"[DEBUG]   口令:  {passwordStr}");
+                        Console.WriteLine($"[DEBUG] 字符集首: {shuffledCharset[0]}  (len={shuffledCharset.Length})");
+                        //Console.WriteLine($"[DEBUG]   密文前32字: {encryptedText[..Math.Min(32, encryptedText.Length)]}");
+                    }
                 }
 
                 EnvelopeData envelope = null;
@@ -5049,6 +5233,12 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                 if (envelope == null)
                 {
                     throw new Exception("解码后的数据无法识别为有效的加密格式 (JSON解析失败或版本不匹配)，可能是密码错误或密文损坏。");
+                    if (DebugMode)
+                    { // ↓ 只加这三行，不改逻辑
+                        Console.WriteLine($"[DEBUG]   口令:  {passwordStr}");
+                        Console.WriteLine($"[DEBUG] 字符集首: {shuffledCharset[0]}  (len={shuffledCharset.Length})");
+                        //Console.WriteLine($"[DEBUG]   密文前32字: {encryptedText[..Math.Min(32, encryptedText.Length)]}");
+                    }
                 }
 
                 try
@@ -5485,21 +5675,52 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                 Console.WriteLine($"3. 并行度 (Parallelism): {CurrentConfig.Parallelism}");
                 Console.WriteLine($"4. 历史记录功能 (EnableHistory): {(CurrentConfig.EnableHistory ? "已启用" : "已禁用")}");
                 Console.WriteLine($"5. Nonce 长度 (NonceLength)(影响V2、V3、V3S密文): {CurrentConfig.NonceLength} 字节");
-                Console.WriteLine("6. 返回主菜单");
-                Console.Write("请选择要修改的参数 (1-6): ");
+                Console.WriteLine($"6. 编码方案 (BaseEncoding): {TextCryptConfig.Base}  (B1 / B2)");
+                Console.WriteLine("7. 返回主菜单");
+                Console.Write("请选择要修改的参数 (1-7): ");
 
                 switch (Console.ReadLine())
                 {
                     case "1":
-                        // … 省略，保持原逻辑 …
+                        Console.Write($"输入新的内存大小 (KB, 当前: {CurrentConfig.MemorySizeKB}): ");
+                        if (int.TryParse(Console.ReadLine(), out int newMemorySize) && newMemorySize > 0)
+                        {
+                            CurrentConfig.MemorySizeKB = newMemorySize;
+                            SaveConfig();
+                            Console.WriteLine($"内存大小已更新为 {newMemorySize} KB");
+                        }
+                        else
+                        {
+                            Console.WriteLine("无效输入，内存大小必须为正整数。");
+                        }
                         break;
 
                     case "2":
-                        // … 省略 …
+                        Console.Write($"输入新的迭代次数 (当前: {CurrentConfig.Iterations}): ");
+                        if (int.TryParse(Console.ReadLine(), out int newIterations) && newIterations > 0)
+                        {
+                            CurrentConfig.Iterations = newIterations;
+                            SaveConfig();
+                            Console.WriteLine($"迭代次数已更新为 {newIterations}");
+                        }
+                        else
+                        {
+                            Console.WriteLine("无效输入，迭代次数必须为正整数。");
+                        }
                         break;
 
                     case "3":
-                        // … 省略 …
+                        Console.Write($"输入新的并行度 (当前: {CurrentConfig.Parallelism}): ");
+                        if (int.TryParse(Console.ReadLine(), out int newParallelism) && newParallelism > 0)
+                        {
+                            CurrentConfig.Parallelism = newParallelism;
+                            SaveConfig();
+                            Console.WriteLine($"并行度已更新为 {newParallelism}");
+                        }
+                        else
+                        {
+                            Console.WriteLine("无效输入，并行度必须为正整数。");
+                        }
                         break;
 
                     case "4":
@@ -5525,7 +5746,21 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                         }
                         break;
 
-                    case "6":
+                    case "6":   // ★★ 新增编码选择
+                        Console.Write("请输入编码方案 (B1 / B2): ");
+                        string newBase = Console.ReadLine()?.Trim().ToUpperInvariant();
+                        if (newBase == "B1" || newBase == "B2")
+                        {
+                            TextCryptConfig.Base = newBase;
+                            SaveConfig();
+                            Console.WriteLine($"编码方案已更新为 {newBase}。");
+                        }
+                        else
+                        {
+                            Console.WriteLine("无效输入：只能是 B1 或 B2。");
+                        }
+                        break;
+                    case "7":
                         Console.WriteLine("返回主菜单。");
                         return;
 
