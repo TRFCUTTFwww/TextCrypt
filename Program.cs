@@ -75,7 +75,7 @@ namespace TextCrypt
             public static int NonceLength = 8;
             public static string Base = "B1";
         }
-
+        public static bool D = false;
         public enum PanelMode { Encrypt, Decrypt }
         private static List<(string EncryptedText, string FilePath, string TempFilePath, byte[] DecryptedBytes, string OriginalMode, char[] OriginalPassword, string PrivateKeyBase64, bool IsV3Mode, string DebugInfo)> mountedCiphertexts = new List<(string EncryptedText, string FilePath, string TempFilePath, byte[] DecryptedBytes, string OriginalMode, char[] OriginalPassword, string PrivateKeyBase64, bool IsV3Mode, string DebugInfo)>();
 
@@ -884,6 +884,11 @@ ooooooooooooo                           .     .oooooo.                          
 #if DEBUG
                 Console.WriteLine("当前版本：DEBUG，已自动启用调试模式");
                 //DebugMode = true;
+                if(!D)
+                {
+                    DebugMode = true;
+                    D = true;
+                }
                 Console.ForegroundColor = ConsoleColor.Red;
                 Console.WriteLine("!!!严禁在生产环境中使用调试版本!!!");
                 Console.ResetColor();
@@ -954,6 +959,9 @@ ooooooooooooo                           .     .oooooo.                          
                         break;
                     case "8":
                         BatchInteractive();
+                        break;
+                    case "test":
+                        Run();
                         break;
                     default:
                         Console.WriteLine("无效的选择，请重试。");
@@ -2751,11 +2759,14 @@ ooooooooooooo                           .     .oooooo.                          
         }
 
         //V3S-
-        static (string encryptedText, string debugInfo) EncryptTextV3S(byte[] plaintextBytes, string recipientPublicKeyBase64, string senderPrivateKeyBase64)
+        static (string encryptedText, string debugInfo) EncryptTextV3S(
+    byte[] plaintextBytes,
+    string recipientPublicKeyPem,
+    string senderPrivateKeyPem)
         {
             byte[] recipientPublicKeyBytes = null;
             byte[] senderPrivateKeyBytes = null;
-            byte[] senderPublicKeyBytes = null; // 新增：存储发送方公钥
+            byte[] senderPublicKeyBytes = null;
             byte[] ephemeralPublicKeyBytes = null;
             byte[] sharedSecret = null;
             byte[] aesKey = null;
@@ -2763,68 +2774,72 @@ ooooooooooooo                           .     .oooooo.                          
             byte[] gcmTag = new byte[16];
             byte[] cipherTextBytes = new byte[plaintextBytes.Length];
             byte[] signatureBytes = null;
-            // —— 必须先把 Base64 字符串解码为 byte[] —— 
-            byte[] pubKeyBytes = Convert.FromBase64String(recipientPublicKeyBase64);
 
-            // 用新的 byte[] 重载派生 CHUNK_SIZE
-            int chunkSize = DeriveChunkSize(pubKeyBytes);
-            // 用新的 byte[] 重载派生 CHUNK_SIZE
-            //CHUNK_SIZE = DeriveChunkSize(pubKeyBytes);
+            // —— 1. 清理并解码接收方公钥 PEM —— 
+            var recPem = recipientPublicKeyPem
+                .Replace("-----BEGIN PUBLIC KEY-----", "")
+                .Replace("-----END PUBLIC KEY-----", "")
+                .Replace("\r", "")
+                .Replace("\n", "")
+                .Trim();
+            recipientPublicKeyBytes = Convert.FromBase64String(recPem);
+
+            // —— 2. 清理并解码发送方私钥 PEM —— 
+            var sndPem = senderPrivateKeyPem
+                .Replace("-----BEGIN PRIVATE KEY-----", "")
+                .Replace("-----END PRIVATE KEY-----", "")
+                .Replace("\r", "")
+                .Replace("\n", "")
+                .Trim();
+            senderPrivateKeyBytes = Convert.FromBase64String(sndPem);
+
+            // —— 3. 派生 chunkSize —— 
+            int chunkSize = DeriveChunkSize(recipientPublicKeyBytes);
             if (DebugMode)
             {
-                Console.WriteLine($"当前CHUNK_SIZE:{chunkSize}");
+                Console.WriteLine($"当前 CHUNK_SIZE: {chunkSize}");
             }
+
             try
             {
-                recipientPublicKeyBase64 = recipientPublicKeyBase64
-                    .Replace("-----BEGIN PUBLIC KEY-----", "")
-                    .Replace("-----END PUBLIC KEY-----", "")
-                    .Replace("\n", "")
-                    .Replace("\r", "")
-                    .Trim();
+                // —— 4. 导入接收方公钥 (ECDH) —— 
+                using var recipientEcdh = ECDiffieHellman.Create();
+                recipientEcdh.ImportSubjectPublicKeyInfo(recipientPublicKeyBytes, out _);
 
-                senderPrivateKeyBase64 = senderPrivateKeyBase64
-                    .Replace("-----BEGIN PRIVATE KEY-----", "")
-                    .Replace("-----END PRIVATE KEY-----", "")
-                    .Replace("\n", "")
-                    .Replace("\r", "")
-                    .Trim();
+                // —— 5. 导入发送方私钥 (ECDSA)，并导出其公钥 —— 
+                using var senderEcdsa = ECDsa.Create();
+                senderEcdsa.ImportPkcs8PrivateKey(senderPrivateKeyBytes, out _);
+                senderPublicKeyBytes = senderEcdsa.ExportSubjectPublicKeyInfo();
 
-                // 1. 导入接收方的公钥
-                recipientPublicKeyBytes = Convert.FromBase64String(recipientPublicKeyBase64);
-                using var recipientPublicKey = ECDiffieHellman.Create();
-                recipientPublicKey.ImportSubjectPublicKeyInfo(recipientPublicKeyBytes, out _);
-
-                // 2. 导入发送方的私钥（用于签名）并导出公钥
-                senderPrivateKeyBytes = Convert.FromBase64String(senderPrivateKeyBase64);
-                using var senderPrivateKey = ECDsa.Create();
-                senderPrivateKey.ImportPkcs8PrivateKey(senderPrivateKeyBytes, out _);
-                senderPublicKeyBytes = senderPrivateKey.ExportSubjectPublicKeyInfo(); // 导出公钥
-
-                // 3. 创建一个临时的 (ephemeral) 密钥对
+                // —— 6. 生成临时 (ephemeral) ECDH 密钥对 —— 
                 using var ephemeralEcdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP521);
                 ephemeralPublicKeyBytes = ephemeralEcdh.ExportSubjectPublicKeyInfo();
 
-                // 4. 使用临时私钥和接收方公钥派生共享密钥
-                sharedSecret = ephemeralEcdh.DeriveKeyFromHash(recipientPublicKey.PublicKey, HashAlgorithmName.SHA512);
+                // —— 7. 派生共享密钥 —— 
+                sharedSecret = ephemeralEcdh.DeriveKeyFromHash(
+                    recipientEcdh.PublicKey,
+                    HashAlgorithmName.SHA512);
 
-                // 5. 使用 HKDF 从共享密钥派生出用于 AES 加密的密钥
-                aesKey = HKDF.DeriveKey(HashAlgorithmName.SHA512, sharedSecret, 32, null, Encoding.UTF8.GetBytes("TextCryptV3S-AES256GCM"));
+                // —— 8. HKDF → AES-GCM 密钥 —— 
+                aesKey = HKDF.DeriveKey(
+                    HashAlgorithmName.SHA512,
+                    sharedSecret,
+                    32,
+                    null,
+                    Encoding.UTF8.GetBytes("TextCryptV3S-AES256GCM"));
 
-                // 6. 使用 AES-GCM 加密
+                // —— 9. AES-GCM 加密 —— 
                 gcmIv = GenerateRandomBytes(12);
                 using (var aesGcm = new AesGcm(aesKey))
                 {
                     aesGcm.Encrypt(gcmIv, plaintextBytes, cipherTextBytes, gcmTag, null);
                 }
 
-                // 7. 使用发送方私钥对密文进行签名
-                // 修复：使用 Program.Combine 确保数据拼接一致性
+                // —— 10. 将密文、IV、Tag 拼接，用于签名 —— 
                 var dataToSign = Program.Combine(cipherTextBytes, gcmTag, gcmIv);
+                signatureBytes = senderEcdsa.SignData(dataToSign, HashAlgorithmName.SHA512);
 
-                signatureBytes = senderPrivateKey.SignData(dataToSign, HashAlgorithmName.SHA512);
-
-                // 8. 构建 V3S 数据包
+                // —— 11. 构建 V3S Envelope —— 
                 var envelope = new EnvelopeData
                 {
                     V = "3S",
@@ -2834,51 +2849,40 @@ ooooooooooooo                           .     .oooooo.                          
                     T = Convert.ToBase64String(gcmTag),
                     Sig = Convert.ToBase64String(signatureBytes)
                 };
-
-                string json = JsonSerializer.Serialize(envelope, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+                string json = JsonSerializer.Serialize(
+                    envelope,
+                    new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
                 byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
 
-                /* ---------- 9. 序列化 + 外部随机 nonce ---------- */
-                int nonceLen = TextCryptConfig.NonceLength;                 // ← 读全局
-                byte[] extNonce = nonceLen == 0 ? Array.Empty<byte>()
-                                                 : GenerateRandomBytes(nonceLen);
+                // —— 12. 外部 Nonce —— 
+                int nonceLen = TextCryptConfig.NonceLength;
+                byte[] extNonce = nonceLen == 0
+                    ? Array.Empty<byte>()
+                    : GenerateRandomBytes(nonceLen);
 
                 byte[] toEncode = new byte[extNonce.Length + jsonBytes.Length];
                 if (extNonce.Length > 0)
                     Buffer.BlockCopy(extNonce, 0, toEncode, 0, extNonce.Length);
                 Buffer.BlockCopy(jsonBytes, 0, toEncode, extNonce.Length, jsonBytes.Length);
-                // 9. 使用接收方公钥作为"密码"进行自定义编码
-                var (shuffledCharset, _, customBase) = GeneratePasswordDerivedCharset(recipientPublicKeyBase64);
-                string encryptedText;
-                if (TextCryptConfig.Base == "B1")
-                {
-                    encryptedText = EncodeChunkWithOriginalAlgorithm(jsonBytes, shuffledCharset,
-                                                                 customBase);
-                }
-                else
-                {
-                    encryptedText = EncodeInternal_Old(toEncode,
-                                                                     shuffledCharset,
-                                                                     customBase,chunkSize);
 
-                }
+                // —— 13. 自定义字符集 & Base-N 编码 —— 
+                var (charset, _, customBase) = GeneratePasswordDerivedCharset(recPem);
+                string encryptedText = EncodeInternal_Old(
+        toEncode,
+        charset,
+        customBase,
+        chunkSize
+    );
 
-
-                string debugInfo = DebugMode ? $@"加密参数 (非对称加密 V3S):
-- Sender Private Key (Base64): {senderPrivateKeyBase64}
-- Sender Public Key (Base64): {Convert.ToBase64String(senderPublicKeyBytes)}
-- Recipient Public Key (Base64): {recipientPublicKeyBase64}
-- JSON Content: {json}
-- Ephemeral Public Key (Base64): {envelope.EK}
-- AES-GCM IV (Base64): {envelope.I}
-- AES-GCM Tag (Base64): {envelope.T}
-- Ciphertext (Base64): {envelope.C}
-- Signature Data Length: {dataToSign.Length}
-- Signature Data (Hex): {BitConverter.ToString(dataToSign).Replace("-", "")}
-- Signature (ECDSA SHA512, Base64): {envelope.Sig}
-- Shared Secret (SHA512, Base64): {Convert.ToBase64String(sharedSecret)}
-- Derived AES Key (HKDF, Base64): {Convert.ToBase64String(aesKey)}
-- Custom Encoding Charset derived from: Recipient Public Key" : string.Empty;
+                // —— 14. 调试信息 —— 
+                string debugInfo = DebugMode ? $@"
+Sender Public Key : {Convert.ToBase64String(senderPublicKeyBytes)}
+Recipient Public Key: {recPem}
+Envelope JSON     : {json}
+Signature (Base64): {envelope.Sig}
+Shared Secret     : {Convert.ToBase64String(sharedSecret)}
+Derived AES Key   : {Convert.ToBase64String(aesKey)}
+" : string.Empty;
 
                 return (encryptedText, debugInfo);
             }
@@ -2888,6 +2892,7 @@ ooooooooooooo                           .     .oooooo.                          
             }
             finally
             {
+                // —— 15. 清理内存 —— 
                 if (recipientPublicKeyBytes != null) Array.Clear(recipientPublicKeyBytes, 0, recipientPublicKeyBytes.Length);
                 if (senderPrivateKeyBytes != null) Array.Clear(senderPrivateKeyBytes, 0, senderPrivateKeyBytes.Length);
                 if (senderPublicKeyBytes != null) Array.Clear(senderPublicKeyBytes, 0, senderPublicKeyBytes.Length);
@@ -2902,8 +2907,8 @@ ooooooooooooo                           .     .oooooo.                          
         }
         //V3加密
         static (string encryptedText, string debugInfo) EncryptTextV3(
-        byte[] plaintextBytes,
-        string recipientPublicKeyBase64)
+    byte[] plaintextBytes,
+    string recipientPublicKeyBase64)
         {
             byte[] recipientPublicKeyBytes = null;
             byte[] ephPubKeyBytes = null;
@@ -2912,54 +2917,54 @@ ooooooooooooo                           .     .oooooo.                          
             byte[] gcmIv = null;
             byte[] gcmTag = new byte[16];
             byte[] cipherTextBytes = new byte[plaintextBytes.Length];
-            // —— 必须先把 Base64 字符串解码为 byte[] —— 
-            byte[] pubKeyBytes = Convert.FromBase64String(recipientPublicKeyBase64);
-            int chunkSize = DeriveChunkSize(pubKeyBytes);
-            // 用新的 byte[] 重载派生 CHUNK_SIZE
-            //CHUNK_SIZE = DeriveChunkSize(pubKeyBytes);
+
+            // —— 1. 清理 PEM 包装并一次性解码 —— 
+            var pem = recipientPublicKeyBase64
+                .Replace("-----BEGIN PUBLIC KEY-----", "")
+                .Replace("-----END PUBLIC KEY-----", "")
+                .Replace("\r", "")
+                .Replace("\n", "")
+                .Trim();
+            recipientPublicKeyBytes = Convert.FromBase64String(pem);
+
+            // —— 2. 派生 chunkSize —— 
+            int chunkSize = DeriveChunkSize(recipientPublicKeyBytes);
             if (DebugMode)
             {
-                Console.WriteLine($"当前CHUNK_SIZE:{chunkSize}");
+                Console.WriteLine($"当前 CHUNK_SIZE: {chunkSize}");
             }
 
             try
             {
-                // 1. 清理 PEM 包装
-                recipientPublicKeyBase64 = recipientPublicKeyBase64
-                    .Replace("-----BEGIN PUBLIC KEY-----", "")
-                    .Replace("-----END PUBLIC KEY-----", "")
-                    .Replace("\n", "")
-                    .Replace("\r", "")
-                    .Trim();
-
-                // 2. 导入接收方公钥
-                recipientPublicKeyBytes = Convert.FromBase64String(recipientPublicKeyBase64);
+                // —— 3. 导入接收方公钥 —— 
                 using var recipientPubKey = ECDiffieHellman.Create();
                 recipientPubKey.ImportSubjectPublicKeyInfo(recipientPublicKeyBytes, out _);
 
-                // 3. 临时 (ephemeral) 密钥对
+                // —— 4. 生成临时（ephemeral）密钥对 —— 
                 using var ephEcdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP521);
                 ephPubKeyBytes = ephEcdh.ExportSubjectPublicKeyInfo();
 
-                // 4. 派生共享密钥
-                sharedSecret = ephEcdh.DeriveKeyFromHash(recipientPubKey.PublicKey,
-                                                         HashAlgorithmName.SHA512);
+                // —— 5. 派生共享密钥 —— 
+                sharedSecret = ephEcdh.DeriveKeyFromHash(
+                    recipientPubKey.PublicKey,
+                    HashAlgorithmName.SHA512);
 
-                // 5. HKDF → AES-GCM 密钥
-                aesKey = HKDF.DeriveKey(HashAlgorithmName.SHA512,
-                                        sharedSecret,
-                                        32,
-                                        null,
-                                        Encoding.UTF8.GetBytes("TextCryptV3-AES256GCM"));
+                // —— 6. HKDF → AES-GCM 密钥 —— 
+                aesKey = HKDF.DeriveKey(
+                    HashAlgorithmName.SHA512,
+                    sharedSecret,
+                    32,
+                    null,
+                    Encoding.UTF8.GetBytes("TextCryptV3-AES256GCM"));
 
-                // 6. AES-GCM 加密
+                // —— 7. AES-GCM 加密 —— 
                 gcmIv = GenerateRandomBytes(12);
                 using (var aesGcm = new AesGcm(aesKey))
                 {
                     aesGcm.Encrypt(gcmIv, plaintextBytes, cipherTextBytes, gcmTag, null);
                 }
 
-                // 7. 组装 Envelope
+                // —— 8. 组装 Envelope —— 
                 var envelope = new EnvelopeData
                 {
                     V = "3",
@@ -2968,23 +2973,27 @@ ooooooooooooo                           .     .oooooo.                          
                     C = Convert.ToBase64String(cipherTextBytes),
                     T = Convert.ToBase64String(gcmTag)
                 };
-                string json = JsonSerializer.Serialize(envelope,
-                                    new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+                string json = JsonSerializer.Serialize(
+                    envelope,
+                    new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
                 byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
 
-                // 8. 生成 / 插入 external nonce
+                // —— 9. 生成 / 插入 external nonce —— 
                 int nonceLen = TextCryptConfig.NonceLength;
-                byte[] extNonce = nonceLen == 0 ? Array.Empty<byte>() : GenerateRandomBytes(nonceLen);
+                byte[] extNonce = nonceLen == 0
+                    ? Array.Empty<byte>()
+                    : GenerateRandomBytes(nonceLen);
 
                 byte[] toEncode = new byte[extNonce.Length + jsonBytes.Length];
                 if (extNonce.Length > 0)
                     Buffer.BlockCopy(extNonce, 0, toEncode, 0, extNonce.Length);
                 Buffer.BlockCopy(jsonBytes, 0, toEncode, extNonce.Length, jsonBytes.Length);
 
-                // 9. 自定义字符集
-                var (charset, _, derivedBase) = GeneratePasswordDerivedCharset(recipientPublicKeyBase64);
-                string encryptedText = null;
-                // 10. 编码
+                // —— 10. 自定义字符集 & Base-N 编码 —— 
+                var (charset, _, derivedBase) =
+                    GeneratePasswordDerivedCharset(pem /* 用同一份 PEM */);
+
+                string encryptedText;
                 if (TextCryptConfig.Base == "B1")
                 {
                     encryptedText = EncodeChunkWithOriginalAlgorithm(jsonBytes, charset, derivedBase);
@@ -2993,8 +3002,9 @@ ooooooooooooo                           .     .oooooo.                          
                 {
                     encryptedText = EncodeInternal_Old(toEncode, charset, derivedBase, chunkSize);
                 }
-                    // 11. 调试输出
-                    string debugInfo = DebugMode ? $@"
+
+                // —— 11. 调试信息输出 —— 
+                string debugInfo = DebugMode ? $@"
 Ephemeral PubKey  : {envelope.EK}
 AES-GCM IV        : {envelope.I}
 AES-GCM Tag       : {envelope.T}
@@ -3011,7 +3021,7 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
             }
             finally
             {
-                // 清内存
+                // —— 12. 清理内存 —— 
                 if (recipientPublicKeyBytes != null) Array.Clear(recipientPublicKeyBytes, 0, recipientPublicKeyBytes.Length);
                 if (ephPubKeyBytes != null) Array.Clear(ephPubKeyBytes, 0, ephPubKeyBytes.Length);
                 if (sharedSecret != null) Array.Clear(sharedSecret, 0, sharedSecret.Length);
@@ -4878,66 +4888,56 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
             }
         }
 
-        private static string TryDetectVersion(string encryptedText, string privateKeyBase64)
+        private static string TryDetectVersion(string encryptedText, string privateKeyPem)
         {
+            // 1. 清理并导入私钥，构造 recipientEcdh
+            var recPem = privateKeyPem
+                .Replace("-----BEGIN PRIVATE KEY-----", "")
+                .Replace("-----END PRIVATE KEY-----", "")
+                .Replace("\r", "").Replace("\n", "").Trim();
+            byte[] recPrivBytes = Convert.FromBase64String(recPem);
+            using var recipientEcdh = ECDiffieHellman.Create();
+            recipientEcdh.ImportPkcs8PrivateKey(recPrivBytes, out _);
+
+            // 2. 派生分块大小 & 自定义字符集
+            byte[] recStaticPub = recipientEcdh.PublicKey.ExportSubjectPublicKeyInfo();
+            int chunkSize = DeriveChunkSize(recStaticPub);
+            string recPubB64 = Convert.ToBase64String(recStaticPub);
+            var (charset, charToValueMap, customBase) = GeneratePasswordDerivedCharset(recPubB64);
+
+            // 3. 统一 Base-N 解码：拿到原始字节流 raw
+            byte[] raw;
             try
             {
-                // 清理私钥
-                privateKeyBase64 = privateKeyBase64
-                    .Replace("-----BEGIN PRIVATE KEY-----", "")
-                    .Replace("-----END PRIVATE KEY-----", "")
-                    .Replace("\n", "")
-                    .Replace("\r", "")
-                    .Trim();
-
-                // 派生公钥
-                byte[] privateKeyBytes = Convert.FromBase64String(privateKeyBase64);
-                using var ecdh = ECDiffieHellman.Create();
-                ecdh.ImportPkcs8PrivateKey(privateKeyBytes, out _);
-                byte[] derivedPublicKeyBytes = ecdh.ExportSubjectPublicKeyInfo();
-                string derivedPublicKeyBase64 = Convert.ToBase64String(derivedPublicKeyBytes);
-
-                // 尝试 V3S 解码
-                try
-                {
-                    var (shuffledCharset, charToValueMap, customBase) = GeneratePasswordDerivedCharset(derivedPublicKeyBase64);
-                    byte[] decodedJsonBytes = SafeDecodeCustomBaseString(
-                        encryptedText,
-                        shuffledCharset,
-                        charToValueMap,
-                        customBase);
-                    string jsonString = Encoding.UTF8.GetString(decodedJsonBytes);
-                    var envelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString);
-                    if (envelope?.V == "3S")
-                        return "3S";
-                    if (envelope?.V == "3")
-                        return "3";
-                }
-                catch
-                {
-                    // V3S 解码失败，尝试 V3（假设 V3 使用标准 Base64）
-                    try
-                    {
-                        byte[] decodedBytes = Convert.FromBase64String(encryptedText);
-                        string jsonString = Encoding.UTF8.GetString(decodedBytes);
-                        var envelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString);
-                        if (envelope?.V == "3")
-                            return "3";
-                    }
-                    catch
-                    {
-                        // 无法识别
-                    }
-                }
+                raw = TryDecodeBytes(encryptedText, charset, charToValueMap, customBase, chunkSize);
             }
             catch
             {
-                // 私钥无效或解码失败
+                return "UNKNOWN";
             }
-            return "UNKNOWN";
+
+            // 4. 自动定位 JSON 起始位置
+            int jsonStart = Array.IndexOf(raw, (byte)'{');
+            if (jsonStart < 0 || jsonStart >= raw.Length)
+                return "UNKNOWN";
+
+            // 5. 从定位位置到末尾反序列化 EnvelopeData
+            EnvelopeData env;
+            try
+            {
+                string json = Encoding.UTF8.GetString(raw, jsonStart, raw.Length - jsonStart);
+                env = JsonSerializer.Deserialize<EnvelopeData>(json);
+            }
+            catch
+            {
+                return "UNKNOWN";
+            }
+
+            // 6. 返回识别到的版本
+            return env?.V == "3" || env?.V == "3S"
+                ? env.V
+                : "UNKNOWN";
         }
-
-
 
 
         public static byte[] Combine(params byte[][] arrays)
@@ -4954,99 +4954,115 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
             return result;
         }
 
-        static (byte[] decryptedBytes, string debugInfo) DecryptTextV3(string encryptedCustomBaseString, string privateKeyBase64)
+        static (byte[] decryptedBytes, string debugInfo) DecryptTextV3(
+    string encryptedCustomBaseString,
+    string privateKeyBase64)
         {
             byte[] privateKeyBytes = null;
-            byte[] derivedPublicKeyBytes = null;
-            byte[] decodedJsonBytes = null;
-            byte[] ephemeralPublicKeyBytes = null;
-            byte[] sharedSecret = null;
-            byte[] aesKey = null;
-            byte[] gcmIv = null;
-            byte[] gcmTag = null;
-            byte[] cipherTextBytes = null;
+            byte[] rawEnvelopeBytes = null;
             byte[] decryptedBytes = null;
+            string debugInfo = string.Empty;
 
             try
             {
+                // —— 一、清理并导入私钥 —— 
                 privateKeyBase64 = privateKeyBase64
-            .Replace("-----BEGIN PRIVATE KEY-----", "")
-            .Replace("-----END PRIVATE KEY-----", "")
-            .Replace("\n", "")
-            .Replace("\r", "")
-            .Trim();
-                // 1. 从私钥派生出公钥，用于后续的自定义解码
+                    .Replace("-----BEGIN PRIVATE KEY-----", "")
+                    .Replace("-----END PRIVATE KEY-----", "")
+                    .Replace("\r", "")
+                    .Replace("\n", "")
+                    .Trim();
                 privateKeyBytes = Convert.FromBase64String(privateKeyBase64);
+
                 using var ecdh = ECDiffieHellman.Create();
                 ecdh.ImportPkcs8PrivateKey(privateKeyBytes, out _);
-                derivedPublicKeyBytes = ecdh.ExportSubjectPublicKeyInfo();
-                string derivedPublicKeyBase64 = Convert.ToBase64String(derivedPublicKeyBytes);
 
-                // 2. 使用派生出的公钥作为“密码”进行自定义解码
-                var (shuffledCharset, charToValueMap, customBase) = GeneratePasswordDerivedCharset(derivedPublicKeyBase64);
-                decodedJsonBytes = SafeDecodeCustomBaseString(encryptedCustomBaseString, shuffledCharset, charToValueMap, customBase);
+                // —— 二、自定义 Base-N 解码（extNonce + JSON）——
+                var (shuffledCharset, charToValueMap, customBase) =
+                    GeneratePasswordDerivedCharset(Convert.ToBase64String(ecdh.PublicKey.ExportSubjectPublicKeyInfo()));
+                rawEnvelopeBytes = SafeDecodeCustomBaseString(
+                    encryptedCustomBaseString,
+                    shuffledCharset,
+                    charToValueMap,
+                    customBase,
+                    password: null,
+                    recipientEcdh: ecdh
+                );
 
-                // 3. 解析JSON数据包
-                string jsonString = Encoding.UTF8.GetString(decodedJsonBytes);
-                var envelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString);
+                // —— 三、自动定位 JSON 起始 —— 
+                int jsonStart = Array.IndexOf(rawEnvelopeBytes, (byte)'{');
+                if (jsonStart < 0)
+                    throw new CryptographicException("无法在解码后数据中找到 JSON 起始标志。");
 
-                if (envelope?.V != "3")
+                // —— 四、反序列化 EnvelopeData —— 
+                string envelopeJson = Encoding.UTF8.GetString(
+                    rawEnvelopeBytes,
+                    jsonStart,
+                    rawEnvelopeBytes.Length - jsonStart
+                );
+                var envelope = JsonSerializer.Deserialize<EnvelopeData>(
+                    envelopeJson,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
+                ) ?? throw new CryptographicException("反序列化 EnvelopeData 失败。");
+
+                if (envelope.V != "3" && envelope.V != "3S")
+                    throw new CryptographicException($"不支持的版本: {envelope.V}");
+
+                // —— 五、恢复临时公钥 & 派生 AES 密钥 —— 
+                byte[] ephPubKeyBytes = Convert.FromBase64String(envelope.EK);
+                using var ephemeral = ECDiffieHellman.Create();
+                ephemeral.ImportSubjectPublicKeyInfo(ephPubKeyBytes, out _);
+
+                byte[] sharedSecret = ecdh.DeriveKeyFromHash(
+                    ephemeral.PublicKey,
+                    HashAlgorithmName.SHA512
+                );
+                byte[] aesKey = HKDF.DeriveKey(
+                    HashAlgorithmName.SHA512,
+                    sharedSecret,
+                    32,
+                    null,
+                    Encoding.UTF8.GetBytes("TextCryptV3-AES256GCM")
+                );
+
+                // —— 六、AES-GCM 解密 C → 明文 —— 
+                byte[] cipherBytes = Convert.FromBase64String(envelope.C);
+                byte[] iv = Convert.FromBase64String(envelope.I);
+                byte[] tag = Convert.FromBase64String(envelope.T);
+                decryptedBytes = new byte[cipherBytes.Length];
+
+                using var aesGcm = new AesGcm(aesKey);
+                aesGcm.Decrypt(iv, cipherBytes, tag, decryptedBytes, null);
+
+                // —— 七、可选调试信息 —— 
+                if (DebugMode)
                 {
-                    throw new CryptographicException("密文不是有效的 V3 格式，或者用于解码的私钥不正确。");
-                }
-
-                // 4. 提取各部分数据
-                ephemeralPublicKeyBytes = Convert.FromBase64String(envelope.EK);
-                gcmIv = Convert.FromBase64String(envelope.I);
-                gcmTag = Convert.FromBase64String(envelope.T);
-                cipherTextBytes = Convert.FromBase64String(envelope.C);
-
-                // 5. 导入临时的公钥
-                using var ephemeralPublicKey = ECDiffieHellman.Create();
-                ephemeralPublicKey.ImportSubjectPublicKeyInfo(ephemeralPublicKeyBytes, out _);
-
-                // 6. 使用自己的私钥和临时公钥派生出相同的共享密钥
-                sharedSecret = ecdh.DeriveKeyFromHash(ephemeralPublicKey.PublicKey, HashAlgorithmName.SHA512);
-
-                // 7. 使用相同的 HKDF 派生出 AES 密钥
-                aesKey = HKDF.DeriveKey(HashAlgorithmName.SHA512, sharedSecret, 32, null, Encoding.UTF8.GetBytes("TextCryptV3-AES256GCM"));
-
-                // 8. 使用 AES-GCM 解密
-                decryptedBytes = new byte[cipherTextBytes.Length];
-                using (var aesGcm = new AesGcm(aesKey))
-                {
-                    aesGcm.Decrypt(gcmIv, cipherTextBytes, gcmTag, decryptedBytes, null);
-                }
-
-                string debugInfo = DebugMode ? $@"解密参数 (非对称加密 V3):
+                    debugInfo = $@"V3 解密成功：
 - Ephemeral Public Key (Base64): {envelope.EK}
-- AES-GCM IV (Base64): {envelope.I}
-- AES-GCM Tag (Base64): {envelope.T}
-- Shared Secret (SHA512, Base64): {Convert.ToBase64String(sharedSecret)}
-- Derived AES Key (HKDF, Base64): {Convert.ToBase64String(aesKey)}
-- Custom Encoding Charset derived from: Own Public Key (derived from private key)" : string.Empty;
+- AES-GCM IV: {envelope.I}
+- AES-GCM Tag: {envelope.T}
+- Derived AES Key (Base64): {Convert.ToBase64String(aesKey)}
+";
+                }
 
                 return (decryptedBytes, debugInfo);
             }
-            catch (Exception ex) when (ex is FormatException || ex is JsonException)
+            catch (Exception ex) when (
+                ex is FormatException ||
+                ex is JsonException ||
+                ex is CryptographicException)
             {
-                throw new CryptographicException("密文格式无效或已损坏，或者用于解码的私钥不正确。", ex);
-            }
-            catch (CryptographicException ex)
-            {
-                throw new CryptographicException($"V3 解密失败，请检查私钥是否正确以及密文是否完整。 {ex.Message}", ex);
+                throw new CryptographicException(
+                    "V3 解密失败：" + ex.Message,
+                    ex
+                );
             }
             finally
             {
+                // 清理敏感数据
                 if (privateKeyBytes != null) Array.Clear(privateKeyBytes, 0, privateKeyBytes.Length);
-                if (derivedPublicKeyBytes != null) Array.Clear(derivedPublicKeyBytes, 0, derivedPublicKeyBytes.Length);
-                if (decodedJsonBytes != null) Array.Clear(decodedJsonBytes, 0, decodedJsonBytes.Length);
-                if (ephemeralPublicKeyBytes != null) Array.Clear(ephemeralPublicKeyBytes, 0, ephemeralPublicKeyBytes.Length);
-                if (sharedSecret != null) Array.Clear(sharedSecret, 0, sharedSecret.Length);
-                if (aesKey != null) Array.Clear(aesKey, 0, aesKey.Length);
-                if (gcmIv != null) Array.Clear(gcmIv, 0, gcmIv.Length);
-                if (gcmTag != null) Array.Clear(gcmTag, 0, gcmTag.Length);
-                if (cipherTextBytes != null) Array.Clear(cipherTextBytes, 0, cipherTextBytes.Length);
+                if (rawEnvelopeBytes != null) Array.Clear(rawEnvelopeBytes, 0, rawEnvelopeBytes.Length);
+                //if (decryptedBytes != null) Array.Clear(decryptedBytes, 0, decryptedBytes.Length);
             }
         }
 
@@ -5057,175 +5073,155 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
         {
             byte[] privateKeyBytes = null;
             byte[] senderPublicKeyBytes = null;
-            byte[] derivedPublicKeyBytes = null;
-            byte[] decodedJsonBytes = null;
-            byte[] ephemeralPublicKeyBytes = null;
-            byte[] sharedSecret = null;
-            byte[] aesKey = null;
-            byte[] gcmIv = null;
-            byte[] gcmTag = null;
-            byte[] cipherTextBytes = null;
+            byte[] decodedEnvelopeBytes = null;
             byte[] decryptedBytes = null;
-            bool canVerifySignature = false;
-            bool isSignatureValid = false;
             string signatureStatus = "SKIPPED";
-            string debugSignatureError = string.Empty;
+            string debugInfo = string.Empty;
 
             try
             {
+                // —— 0. 清理输入串 —— 
                 privateKeyBase64 = privateKeyBase64
                     .Replace("-----BEGIN PRIVATE KEY-----", "")
                     .Replace("-----END PRIVATE KEY-----", "")
-                    .Replace("\n", "")
                     .Replace("\r", "")
+                    .Replace("\n", "")
                     .Trim();
 
-                if (!string.IsNullOrEmpty(senderPublicKeyBase64))
+                bool canVerifySignature = false;
+                if (!string.IsNullOrWhiteSpace(senderPublicKeyBase64))
                 {
                     senderPublicKeyBase64 = senderPublicKeyBase64
                         .Replace("-----BEGIN PUBLIC KEY-----", "")
                         .Replace("-----END PUBLIC KEY-----", "")
-                        .Replace("\n", "")
                         .Replace("\r", "")
+                        .Replace("\n", "")
                         .Trim();
                     senderPublicKeyBytes = Convert.FromBase64String(senderPublicKeyBase64);
                     canVerifySignature = true;
                 }
 
-                // 1. 派生公钥
+                // —— 1. 导入私钥 & 派生公钥charset —— 
                 privateKeyBytes = Convert.FromBase64String(privateKeyBase64);
                 using var ecdh = ECDiffieHellman.Create();
                 ecdh.ImportPkcs8PrivateKey(privateKeyBytes, out _);
-                derivedPublicKeyBytes = ecdh.ExportSubjectPublicKeyInfo();
-                string derivedPublicKeyBase64 = Convert.ToBase64String(derivedPublicKeyBytes);
+                string derivedPubB64 = Convert.ToBase64String(
+                    ecdh.PublicKey.ExportSubjectPublicKeyInfo()
+                );
+                var (shuffledCharset, charToValueMap, customBase) =
+                    GeneratePasswordDerivedCharset(derivedPubB64);
 
-                // 2. 解码密文
-                var (shuffledCharset, charToValueMap, customBase) = GeneratePasswordDerivedCharset(derivedPublicKeyBase64);
-                decodedJsonBytes = SafeDecodeCustomBaseString(
+                // —— 2. Base-N 解码(extNonce + JSON) —— 
+                decodedEnvelopeBytes = SafeDecodeCustomBaseString(
                     encryptedCustomBaseString,
                     shuffledCharset,
                     charToValueMap,
-                    customBase);
+                    customBase,
+                    password: null,
+                    recipientEcdh: ecdh
+                );
 
-                // 3. 解析 JSON
-                string jsonString = Encoding.UTF8.GetString(decodedJsonBytes);
-                var envelope = JsonSerializer.Deserialize<EnvelopeData>(jsonString);
+                // —— 3. 自动定位 JSON 片段 —— 
+                int idx = Array.IndexOf(decodedEnvelopeBytes, (byte)'{');
+                if (idx < 0)
+                    throw new CryptographicException("无法定位 JSON 起始。");
+                string envelopeJson = Encoding.UTF8.GetString(
+                    decodedEnvelopeBytes, idx, decodedEnvelopeBytes.Length - idx
+                );
+                var envelope = JsonSerializer.Deserialize<EnvelopeData>(
+                    envelopeJson,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
+                ) ?? throw new CryptographicException("反序列化 EnvelopeData 失败。");
+                if (envelope.V != "3S")
+                    throw new CryptographicException("密文版本非 V3S，或私钥不匹配。");
 
-                if (envelope?.V != "3S")
-                    throw new CryptographicException("密文不是有效的 V3S 格式，或者用于解码的私钥不正确。");
-
-                // 4. 提取数据
-                ephemeralPublicKeyBytes = Convert.FromBase64String(envelope.EK);
-                gcmIv = Convert.FromBase64String(envelope.I);
-                gcmTag = Convert.FromBase64String(envelope.T);
-                cipherTextBytes = Convert.FromBase64String(envelope.C);
-                byte[] signatureBytes = Convert.FromBase64String(envelope.Sig);
-
-                // 5. 验证签名 - 使用更稳健的方法
+                // —— 4. 签名验证 —— 
                 if (canVerifySignature)
                 {
                     try
                     {
-                        // 修复：使用 Program.Combine 确保数据拼接一致性
-                        byte[] verificationData = Program.Combine(cipherTextBytes, gcmTag, gcmIv);
-
-                        using var senderEcdsa = ECDsa.Create();
-                        senderEcdsa.ImportSubjectPublicKeyInfo(senderPublicKeyBytes, out _);
-
-                        // 执行签名验证
-                        isSignatureValid = senderEcdsa.VerifyData(verificationData, signatureBytes, HashAlgorithmName.SHA512);
-                        signatureStatus = isSignatureValid ? "VALID" : "INVALID";
-
-                        // 立即清理验证数据
-                        Array.Clear(verificationData, 0, verificationData.Length);
+                        byte[] dataToVerify = Program.Combine(
+                            Convert.FromBase64String(envelope.C),
+                            Convert.FromBase64String(envelope.T),
+                            Convert.FromBase64String(envelope.I)
+                        );
+                        using var ecdsa = ECDsa.Create();
+                        ecdsa.ImportSubjectPublicKeyInfo(senderPublicKeyBytes, out _);
+                        bool valid = ecdsa.VerifyData(
+                            dataToVerify,
+                            Convert.FromBase64String(envelope.Sig),
+                            HashAlgorithmName.SHA512
+                        );
+                        signatureStatus = valid ? "VALID" : "INVALID";
+                        Array.Clear(dataToVerify, 0, dataToVerify.Length);
                     }
                     catch (Exception ex)
                     {
-                        isSignatureValid = false;
                         signatureStatus = "ERROR";
-                        debugSignatureError = ex.Message;
+                        debugInfo += $"签名验证异常: {ex.Message}\n";
                     }
                 }
 
-                // 6. 导入临时公钥
-                using var ephemeralPublicKey = ECDiffieHellman.Create();
-                ephemeralPublicKey.ImportSubjectPublicKeyInfo(ephemeralPublicKeyBytes, out _);
-
-                // 7. 派生共享密钥
-                sharedSecret = ecdh.DeriveKeyFromHash(
-                    ephemeralPublicKey.PublicKey,
-                    HashAlgorithmName.SHA512);
-
-                // 8. 派生 AES 密钥
-                aesKey = HKDF.DeriveKey(
+                // —— 5. 派生 AES 密钥 & 解密 —— 
+                using var ephEcdh = ECDiffieHellman.Create();
+                ephEcdh.ImportSubjectPublicKeyInfo(
+                    Convert.FromBase64String(envelope.EK),
+                    out _
+                );
+                byte[] sharedSecret = ecdh.DeriveKeyFromHash(
+                    ephEcdh.PublicKey, HashAlgorithmName.SHA512
+                );
+                byte[] aesKey = HKDF.DeriveKey(
                     HashAlgorithmName.SHA512,
                     sharedSecret,
                     32,
                     null,
-                    Encoding.UTF8.GetBytes("TextCryptV3S-AES256GCM"));
+                    Encoding.UTF8.GetBytes("TextCryptV3S-AES256GCM")
+                );
 
-                // 9. AES-GCM 解密
-                decryptedBytes = new byte[cipherTextBytes.Length];
-                try
+                byte[] iv = Convert.FromBase64String(envelope.I);
+                byte[] tag = Convert.FromBase64String(envelope.T);
+                byte[] cipher = Convert.FromBase64String(envelope.C);
+                decryptedBytes = new byte[cipher.Length];
+                using (var aesGcm = new AesGcm(aesKey))
                 {
-                    using (var aesGcm = new AesGcm(aesKey))
-                    {
-                        aesGcm.Decrypt(gcmIv, cipherTextBytes, gcmTag, decryptedBytes, null);
-                    }
-                }
-                catch (CryptographicException ex)
-                {
-                    throw new CryptographicException($"AES-GCM 解密失败，可能是密文或密钥错误: {ex.Message}", ex);
+                    aesGcm.Decrypt(iv, cipher, tag, decryptedBytes, null);
                 }
 
-                // 构建调试信息
-                string debugInfo = DebugMode
-                    ? $@"解密参数 (非对称加密 V3S):
-- Private Key (Base64): {privateKeyBase64}
-- Derived Public Key (Base64): {derivedPublicKeyBase64}
-- Sender Public Key (Base64): {senderPublicKeyBase64 ?? "Not provided"}
-- JSON Content: {jsonString}
-- Ephemeral Public Key (Base64): {envelope.EK}
-- AES-GCM IV (Base64): {envelope.I}
-- AES-GCM Tag (Base64): {envelope.T}
-- Ciphertext (Base64): {envelope.C}
-- Signature (ECDSA SHA512, Base64): {envelope.Sig}
-- Signature Verification: {signatureStatus}{(debugSignatureError != string.Empty ? $" (Error: {debugSignatureError})" : "")}
-- Shared Secret (SHA512, Base64): {Convert.ToBase64String(sharedSecret)}
-- Derived AES Key (HKDF, Base64): {Convert.ToBase64String(aesKey)}
-- Decrypted Bytes Length: {decryptedBytes.Length}
-- Decrypted Bytes (Hex): {BitConverter.ToString(decryptedBytes).Replace("-", "")}
-- Custom Encoding Charset derived from: Own Public Key (derived from private key)"
-                    : string.Empty;
+                // —— 6. 生成 Debug 信息 —— 
+                if (DebugMode)
+                {
+                    debugInfo += $@"V3S 解密成功：
+- JSON Envelope: {envelopeJson}
+- Ephemeral Key (EK): {envelope.EK}
+- IV: {envelope.I}
+- Tag: {envelope.T}
+- Signature Status: {signatureStatus}
+";
+                }
 
-                // 返回前复制 decryptedBytes，防止被清零
-                byte[] resultBytes = new byte[decryptedBytes.Length];
-                Buffer.BlockCopy(decryptedBytes, 0, resultBytes, 0, decryptedBytes.Length);
-                return (resultBytes, debugInfo, signatureStatus);
+                // 返回前克隆一份结果，避免 finally 清零
+                var result = new byte[decryptedBytes.Length];
+                Buffer.BlockCopy(decryptedBytes, 0, result, 0, decryptedBytes.Length);
+                return (result, debugInfo, signatureStatus);
             }
-            catch (Exception ex) when (ex is FormatException || ex is JsonException)
+            catch (Exception ex) when (
+                ex is FormatException ||
+                ex is JsonException ||
+                ex is CryptographicException)
             {
-                throw new CryptographicException("密文格式无效或已损坏，或者用于解码的私钥不正确。", ex);
-            }
-            catch (CryptographicException ex)
-            {
-                throw new CryptographicException($"V3S 解密失败，请检查私钥是否正确以及密文是否完整。 {ex.Message}", ex);
+                throw new CryptographicException("V3S 解密失败：" + ex.Message, ex);
             }
             finally
             {
+                // 只清理中间敏感数据，不清理 decryptedBytes 的 clone
                 if (privateKeyBytes != null) Array.Clear(privateKeyBytes, 0, privateKeyBytes.Length);
                 if (senderPublicKeyBytes != null) Array.Clear(senderPublicKeyBytes, 0, senderPublicKeyBytes.Length);
-                if (derivedPublicKeyBytes != null) Array.Clear(derivedPublicKeyBytes, 0, derivedPublicKeyBytes.Length);
-                if (decodedJsonBytes != null) Array.Clear(decodedJsonBytes, 0, decodedJsonBytes.Length);
-                if (ephemeralPublicKeyBytes != null) Array.Clear(ephemeralPublicKeyBytes, 0, ephemeralPublicKeyBytes.Length);
-                if (sharedSecret != null) Array.Clear(sharedSecret, 0, sharedSecret.Length);
-                if (aesKey != null) Array.Clear(aesKey, 0, aesKey.Length);
-                if (gcmIv != null) Array.Clear(gcmIv, 0, gcmIv.Length);
-                if (gcmTag != null) Array.Clear(gcmTag, 0, gcmTag.Length);
-                if (cipherTextBytes != null) Array.Clear(cipherTextBytes, 0, cipherTextBytes.Length);
-                if (decryptedBytes != null) Array.Clear(decryptedBytes, 0, decryptedBytes.Length);
+                if (decodedEnvelopeBytes != null) Array.Clear(decodedEnvelopeBytes, 0, decodedEnvelopeBytes.Length);
+                // sharedSecret、aesKey、iv、tag、cipher、decryptedBytes(原引用)等也可清理
             }
         }
+
 
         static void DecryptWithPassword(string encryptedText)
         {
@@ -5398,53 +5394,25 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
             char[] password = null,
             ECDiffieHellman recipientEcdh = null)
         {
-            // —— 一、公钥解密分支 —— 
             if (recipientEcdh != null)
             {
-                // 1. 派生 chunkSize （和加密时相同）
-                int chunkSize = DeriveChunkSize(recipientEcdh.PublicKey.ExportSubjectPublicKeyInfo());
+                // 1. 导出静态公钥 bytes
+                byte[] recipientStaticPubBytes =
+                    recipientEcdh.PublicKey.ExportSubjectPublicKeyInfo();
 
-                // 2. 先把 Base-custom-string 解成 extNonce＋JSON
-                byte[] raw = TryDecodeBytes(ciphertext, shuffledCharset, map, customBase, chunkSize);
+                // 2. 派生 chunkSize
+                int chunkSize = DeriveChunkSize(recipientStaticPubBytes);
 
-                // 3. 跳过 external nonce，反序列化 EnvelopeData
-                int extNonceLen = TextCryptConfig.NonceLength;
-                byte[] jsonBytes = raw[extNonceLen..];
-                var envelope = JsonSerializer.Deserialize<EnvelopeData>(
-                    Encoding.UTF8.GetString(jsonBytes),
-                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                // 3. 重新生成自定义字符集（避免跟传进来的 charset 冲突）
+                string recPubB64 = Convert.ToBase64String(recipientStaticPubBytes);
+                var (charsetTemp, mapTemp, baseTemp) =
+                    GeneratePasswordDerivedCharset(recPubB64);
+                shuffledCharset = charsetTemp;
+                map = mapTemp;
+                customBase = baseTemp;
 
-                // 4. 用我们自己的私钥和对端的临时公钥派生相同的 AES key
-                byte[] ephPubKeyBytes = Convert.FromBase64String(envelope.EK);
-
-                // 把对端的 Ephemeral 公钥导入
-                using var remoteEcdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP521);
-                remoteEcdh.ImportSubjectPublicKeyInfo(ephPubKeyBytes, out _);
-
-                // 用自己的私钥 + 对端公钥，Derive sharedSecret
-                byte[] sharedSecret = recipientEcdh.DeriveKeyFromHash(
-                    remoteEcdh.PublicKey,
-                    HashAlgorithmName.SHA512);
-
-                byte[] aesKey = HKDF.DeriveKey(
-                    HashAlgorithmName.SHA512,
-                    sharedSecret,
-                    32,
-                    null,
-                    Encoding.UTF8.GetBytes("TextCryptV3-AES256GCM"));
-
-                // 5. 用 AES-GCM 解密 C（ciphertext）→ 明文
-                byte[] cipherBytes = Convert.FromBase64String(envelope.C);
-                byte[] iv = Convert.FromBase64String(envelope.I);
-                byte[] tag = Convert.FromBase64String(envelope.T);
-                var plain = new byte[cipherBytes.Length];
-
-                using (var aesGcm = new AesGcm(aesKey))
-                {
-                    aesGcm.Decrypt(iv, cipherBytes, tag, plain, null);
-                }
-
-                return plain;
+                // 4. Base-N 解码，得到 raw = extNonce + JSON
+                return TryDecodeBytes(ciphertext, shuffledCharset, map, customBase, chunkSize);
             }
 
             // —— 二、对称密码分支 —— 
@@ -6142,5 +6110,208 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                 }
             }
         }
+
+        public static void Run()
+        {
+            Console.WriteLine("======== TextCrypt 全模式自动化烟测 ========\n");
+
+            // 1. 明文：随机 ASCII 文本
+            string plaintext = GenerateRandomString(64);
+            var plaintextBytes = Encoding.UTF8.GetBytes(plaintext);
+            Console.WriteLine($"[Plaintext]\n{plaintext}\n");
+
+            // 2. 随机密码
+            string password = GenerateRandomString(16);
+            Console.WriteLine($"[Password]  {password}\n");
+
+            // 3. 全局调试参数
+            TextCryptConfig.NonceLength = 8;
+            DebugMode = true;
+
+            // 4. 测试编码模式
+            var encodingModes = new[] { "B1", "B2" };
+            var versions = new[] { "V0", "V0.5", "V1", "V2", "V3", "V3S" };
+
+            foreach (var encoding in encodingModes)
+            {
+                Console.WriteLine($"===== 编码模式 {encoding} =====");
+                TextCryptConfig.Base = encoding;
+
+                foreach (var ver in versions)
+                {
+                    Console.WriteLine($"----- 版本 {ver} ({encoding}) -----");
+
+                    try
+                    {
+                        if (ver == "V3" || ver == "V3S")
+                        {
+                            // 非对称加密测试
+                            TestAsymmetricEncryption(plaintextBytes, plaintext, ver, encoding);
+                        }
+                        else
+                        {
+                            // 对称加密测试
+                            TestSymmetricEncryption(plaintextBytes, plaintext, password, ver, encoding);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"模式 {ver} ({encoding}) 测试异常: {ex.Message}");
+                        Console.WriteLine("Status: FAILED\n");
+                    }
+                }
+                Console.WriteLine();
+            }
+
+            Console.WriteLine("======== 测试结束 ========");
+        }
+
+        private static void TestSymmetricEncryption(byte[] plaintextBytes, string plaintext, string password, string version, string encoding)
+        {
+            try
+            {
+                // 加密
+                var (cipher, debugInfo) = EncryptText(plaintextBytes, password.ToCharArray(), version);
+
+                if (string.IsNullOrEmpty(cipher))
+                {
+                    Console.WriteLine($"模式 {version} ({encoding}) 加密失败");
+                    Console.WriteLine("Status: FAILED\n");
+                    return;
+                }
+
+                Console.WriteLine($"密文长度: {cipher.Length} 字符");
+                Console.WriteLine($"密文前缀: {cipher.Substring(0, Math.Min(32, cipher.Length))}...");
+
+                // 解密
+                var (decryptedBytes, decryptDebugInfo) = DecryptText(cipher, password.ToCharArray());
+                string decryptedText = Encoding.UTF8.GetString(decryptedBytes);
+
+                bool success = decryptedText == plaintext;
+                Console.WriteLine($"解密校验: {(success ? "SUCCESS" : "FAILED")}");
+
+                if (!success)
+                {
+                    Console.WriteLine($"期望: {plaintext}");
+                    Console.WriteLine($"实际: {decryptedText}");
+                }
+
+                Console.WriteLine($"Status: {(success ? "SUCCESS" : "FAILED")}\n");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"对称加密测试异常: {ex.Message}");
+                Console.WriteLine("Status: FAILED\n");
+            }
+        }
+
+        private static void TestAsymmetricEncryption(byte[] plaintextBytes, string plaintext, string version, string encoding)
+        {
+            try
+            {
+                // 生成密钥对
+                using var recipientEcdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP521);
+                string recipientPublicKey = Convert.ToBase64String(recipientEcdh.ExportSubjectPublicKeyInfo());
+                string recipientPrivateKey = Convert.ToBase64String(recipientEcdh.ExportPkcs8PrivateKey());
+
+                string cipher;
+                string debugInfo;
+
+                if (version == "V3S")
+                {
+                    // V3S 需要发送方密钥对用于签名
+                    using var senderEcdsa = ECDsa.Create(ECCurve.NamedCurves.nistP521);
+                    string senderPublicKey = Convert.ToBase64String(senderEcdsa.ExportSubjectPublicKeyInfo());
+                    string senderPrivateKey = Convert.ToBase64String(senderEcdsa.ExportPkcs8PrivateKey());
+
+                    // 加密
+                    var encryptResult = EncryptTextV3S(plaintextBytes, recipientPublicKey, senderPrivateKey);
+                    cipher = encryptResult.encryptedText;
+                    debugInfo = encryptResult.debugInfo;
+
+                    if (string.IsNullOrEmpty(cipher))
+                    {
+                        Console.WriteLine($"模式 {version} ({encoding}) 加密失败");
+                        Console.WriteLine("Status: FAILED\n");
+                        return;
+                    }
+
+                    Console.WriteLine($"密文长度: {cipher.Length} 字符");
+                    Console.WriteLine($"密文前缀: {cipher.Substring(0, Math.Min(32, cipher.Length))}...");
+
+                    // 解密并验证签名
+                    var (decryptedBytes, decryptDebugInfo, signatureStatus) = DecryptTextV3S(cipher, recipientPrivateKey, senderPublicKey);
+                    string decryptedText = Encoding.UTF8.GetString(decryptedBytes);
+
+                    bool decryptSuccess = decryptedText == plaintext;
+                    bool signatureValid = signatureStatus == "VALID";
+
+                    Console.WriteLine($"解密校验: {(decryptSuccess ? "SUCCESS" : "FAILED")}");
+                    Console.WriteLine($"签名验证: {signatureStatus}");
+
+                    if (!decryptSuccess)
+                    {
+                        Console.WriteLine($"期望: {plaintext}");
+                        Console.WriteLine($"实际: {decryptedText}");
+                    }
+
+                    bool overallSuccess = decryptSuccess && signatureValid;
+                    Console.WriteLine($"Status: {(overallSuccess ? "SUCCESS" : "FAILED")}\n");
+                }
+                else // V3
+                {
+                    // 加密
+                    var encryptResult = EncryptTextV3(plaintextBytes, recipientPublicKey);
+                    cipher = encryptResult.encryptedText;
+                    debugInfo = encryptResult.debugInfo;
+
+                    if (string.IsNullOrEmpty(cipher))
+                    {
+                        Console.WriteLine($"模式 {version} ({encoding}) 加密失败");
+                        Console.WriteLine("Status: FAILED\n");
+                        return;
+                    }
+
+                    Console.WriteLine($"密文长度: {cipher.Length} 字符");
+                    Console.WriteLine($"密文前缀: {cipher.Substring(0, Math.Min(32, cipher.Length))}...");
+
+                    // 解密
+                    var (decryptedBytes, decryptDebugInfo) = DecryptTextV3(cipher, recipientPrivateKey);
+                    string decryptedText = Encoding.UTF8.GetString(decryptedBytes);
+
+                    bool success = decryptedText == plaintext;
+                    Console.WriteLine($"解密校验: {(success ? "SUCCESS" : "FAILED")}");
+
+                    if (!success)
+                    {
+                        Console.WriteLine($"期望: {plaintext}");
+                        Console.WriteLine($"实际: {decryptedText}");
+                    }
+
+                    Console.WriteLine($"Status: {(success ? "SUCCESS" : "FAILED")}\n");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"非对称加密测试异常: {ex.Message}");
+                Console.WriteLine("Status: FAILED\n");
+            }
+        }
+
+        // 随机 ASCII 文本（包含大小写字母和数字）
+        private static string GenerateRandomString(int len)
+        {
+            const string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            using var rng = RandomNumberGenerator.Create();
+            var sb = new StringBuilder(len);
+            Span<byte> buf = stackalloc byte[1];
+            for (int i = 0; i < len; i++)
+            {
+                rng.GetBytes(buf);
+                sb.Append(chars[buf[0] % chars.Length]);
+            }
+            return sb.ToString();
+        }
     }
 }
+
