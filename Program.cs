@@ -1,30 +1,52 @@
-﻿using System;
-using System.Data.SQLite;
-using System.Numerics;
-using System.Security.Cryptography;
-using System.Text.Json;
-using System.Text;
-using Terminal.Gui;
-using System.Diagnostics;
-using System.IO;
+﻿using Konscious.Security.Cryptography;
+using NStack;
+using Spectre.Console;
+using System;
 using System.Collections.Generic;
+using System.Data.SQLite;
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
+using System.IO;
 using System.Linq;
-using Konscious.Security.Cryptography;
-using System.Text.Json.Serialization;
+using System.Numerics;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security;
-using Spectre.Console;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using Terminal.Gui;
+// 如果你还用到了 Terminal.Gui.Attribute，也可以加上
+using TGAttribute = Terminal.Gui.Attribute;
 using TGColor = Terminal.Gui.Color;
 using TGDIM = Terminal.Gui.Dim;
 using TGPos = Terminal.Gui.Pos;
-// 如果你还用到了 Terminal.Gui.Attribute，也可以加上
-using TGAttribute = Terminal.Gui.Attribute;
-using NStack;
-using System.Reflection;
-using System.Diagnostics.Metrics;
 
 namespace TextCrypt
 {
+    public static class ReadOnlyListExtensions
+    {
+        /// <summary>
+        /// 为 IReadOnlyList<T> 提供 IndexOf 支持，使用自定义 IEqualityComparer<T>。
+        /// </summary>
+        public static int IndexOf<T>(
+            this IReadOnlyList<T> list,
+            T value,
+            IEqualityComparer<T> comparer)
+        {
+            if (list is null) throw new ArgumentNullException(nameof(list));
+            if (comparer is null) throw new ArgumentNullException(nameof(comparer));
+
+            for (int i = 0, n = list.Count; i < n; i++)
+            {
+                if (comparer.Equals(list[i], value))
+                    return i;
+            }
+            return -1;
+        }
+    }
     class Program
     {
         enum LineMode { Encrypt, Decrypt }
@@ -36,6 +58,7 @@ namespace TextCrypt
             public string CipherText { get; set; }
             public string CheckSum { get; set; }
         }
+
 
         // Envelope for encrypted data
         class EnvelopeData
@@ -962,6 +985,9 @@ ooooooooooooo                           .     .oooooo.                          
                         break;
                     case "test":
                         Run();
+                        break;
+                    case "/":
+                        RunShell();
                         break;
                     default:
                         Console.WriteLine("无效的选择，请重试。");
@@ -5334,51 +5360,139 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                 Array.Clear(password, 0, password.Length);
             }
         }
+        /// <summary>
+        /// 尝试按自定义算法解码，并输出调试信息以定位 B1/B2 格式差异
+        /// </summary>
         private static bool TryDecode(
-    Func<byte[]> decodeFunc,                // 传入一个“具体算法”
-    out byte[] decoded)
+    Func<byte[]> decodeFunc,
+    out byte[] decoded,string mode)
         {
             decoded = null;
-
+            byte[] bytes;
             try
             {
-                var bytes = decodeFunc();
+                bytes = decodeFunc();
+            }
+            catch (Exception ex)
+            {
+                if (DebugMode)
+                    Console.WriteLine($"[DEBUG] decodeFunc 失败: {ex.Message}");
+                return false;
+            }
 
-                // 判空
-                if (bytes == null || bytes.Length == 0) return false;
-
-                // 粗筛：第一字节得看起来像 JSON（`{` 或 `[`）
-                if (bytes[0] != (byte)'{' && bytes[0] != (byte)'[') return false;
-
-                // 细筛：能否解析成 EnvelopeData 并且版本号合法
-                var env = JsonSerializer.Deserialize<EnvelopeData>(
-                              bytes,
-                              new JsonSerializerOptions
-                              {
-                                  DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-                              });
-
-                if (env == null) return false;
-
-                switch (env.V)
+            if (DebugMode)
+            {
+                Console.WriteLine($"===== TryDecode 调试信息开始{mode} =====");
+                if (bytes == null)
                 {
-                    case "0":      // V0   – 核心直加密
-                    case "0.5":    // V0.5 – 盐值随机模式
-                    case "1":      // V1   – 双层加密
-                    case "2":      // V2   – 直接加密
-                    case "3":      // V3   – 公私钥（Hybrid）
-                    case "3S":     // V3S  – 公私钥（带签名）
-                        decoded = bytes;
-                        return true;      // ★ 认为解码成功
-                    default:
-                        return false;
+                    Console.WriteLine("[DEBUG] bytes == null");
+                }
+                else if (bytes.Length == 0)
+                {
+                    Console.WriteLine("[DEBUG] bytes.Length == 0");
+                }
+                else
+                {
+                    Console.WriteLine($"[DEBUG] 初始 bytes.Length = {bytes.Length}");
+                    // UTF-8 or Hex preview
+                    try
+                    {
+                        Console.WriteLine("[DEBUG] UTF-8 内容: \n" + Encoding.UTF8.GetString(bytes));
+                    }
+                    catch
+                    {
+                        Console.WriteLine("[DEBUG] Hex 预览: " + string.Join(" ", bytes.Take(128).Select(b => b.ToString("X2"))) + (bytes.Length > 128 ? " …" : string.Empty));
+                    }
                 }
             }
-            catch
+
+            // —— 1. 定位 JSON 块 ——
+            if (bytes == null || bytes.Length == 0)
+                return false;
+
+            int idxCurly = Array.IndexOf(bytes, (byte)'{');
+            int idxSquare = Array.IndexOf(bytes, (byte)'[');
+            int startIdx = -1;
+            char openChar = '\0', closeChar = '\0';
+            if (idxCurly >= 0 && (idxSquare < 0 || idxCurly < idxSquare))
             {
-                return false;                 // 任何异常都视为失败
+                startIdx = idxCurly;
+                openChar = '{'; closeChar = '}';
+            }
+            else if (idxSquare >= 0)
+            {
+                startIdx = idxSquare;
+                openChar = '['; closeChar = ']';
+            }
+            if (startIdx < 0)
+                return false;
+
+            int depth = 0, endIdx = -1;
+            for (int i = startIdx; i < bytes.Length; i++)
+            {
+                if (bytes[i] == (byte)openChar) depth++;
+                else if (bytes[i] == (byte)closeChar) depth--;
+                if (depth == 0)
+                {
+                    endIdx = i;
+                    break;
+                }
+            }
+            if (endIdx < 0)
+                return false;
+
+            var jsonBytes = bytes.Skip(startIdx).Take(endIdx - startIdx + 1).ToArray();
+
+            if (DebugMode)
+            {
+                Console.WriteLine("===== JSON 子串提取 =====");
+                Console.WriteLine(Encoding.UTF8.GetString(jsonBytes));
+                if (startIdx > 0)
+                {
+                    var prefix = bytes.Take(startIdx).ToArray();
+                    Console.WriteLine("[DEBUG] 前缀 Hex: " + string.Join(" ", prefix.Select(b => b.ToString("X2"))) + (prefix.Length > 16 ? " …" : string.Empty));
+                }
+                Console.WriteLine($"===== TryDecode 调试信息结束{mode} =====");
+            }
+
+            // —— 2. 粗筛/细筛 ——
+            if (jsonBytes.Length == 0) return false;
+            byte first = jsonBytes[0];
+            if (first != (byte)'{' && first != (byte)'[') return false;
+
+            EnvelopeData env;
+            try
+            {
+                env = JsonSerializer.Deserialize<EnvelopeData>(
+                    jsonBytes,
+                    new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+            }
+            catch (JsonException jex)
+            {
+                if (DebugMode)
+                    Console.WriteLine($"[DEBUG] JSON 反序列化失败: {jex.Message}");
+                return false;
+            }
+            if (env == null) return false;
+
+            switch (env.V)
+            {
+                case "0":
+                case "0.5":
+                case "1":
+                case "2":
+                case "3":
+                case "3S":
+                    decoded = jsonBytes;
+                    return true;
+                default:
+                    return false;
             }
         }
+
+
+
+
 
         /// <summary>
         /// 同时支持「对称密码」（V0/V1/V2）和「公钥」（V3/ECDH＋AES-GCM）解密
@@ -5422,16 +5536,16 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
 
                 // 1) 新版分块
                 if (TryDecode(
-                        () => DecodeWithChunking(ciphertext, shuffledCharset, map, customBase, chunkSize),
-                        out var bytesNew))
+        () => DecodeChunkWithOriginalAlgorithm(ciphertext, shuffledCharset, map, customBase),
+        out var bytesNew,
+        "B1"))                 // ← mode 作为第三个参数
                 {
                     return bytesNew;
                 }
-
                 // 2) 旧版 B2
                 if (TryDecode(
                         () => DecodeInternal_Old(ciphertext, shuffledCharset, map, customBase, chunkSize),
-                        out var bytesOld))
+                        out var bytesOld,"B2"))
                 {
                     return bytesOld;
                 }
@@ -5452,15 +5566,24 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
             int chunkSize)
         {
             if (TryDecode(
-                    () => DecodeWithChunking(ciphertext, shuffledCharset, map, customBase, chunkSize),
-                    out var b1))
+                    () => DecodeChunkWithOriginalAlgorithm(ciphertext, shuffledCharset, map, customBase),
+                    out var b1, "B1"))
             {
+                if (DebugMode)
+                {
+                    Console.WriteLine($"[DEBUG]完整解码内容:{b1}");
+                }
                 return b1;
+                
             }
             if (TryDecode(
                     () => DecodeInternal_Old(ciphertext, shuffledCharset, map, customBase, chunkSize),
-                    out var b2))
+                    out var b2, "B2"))
             {
+                if (DebugMode)
+                {
+                    Console.WriteLine($"[DEBUG]完整解码内容:{b2}");
+                }
                 return b2;
             }
             throw new FormatException("无法 Base-custom 解码");
@@ -6115,6 +6238,13 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
         {
             Console.WriteLine("======== TextCrypt 全模式自动化烟测 ========\n");
 
+            // 用来统计结果：results[模式][版本] = 是否成功
+            var results = new Dictionary<string, Dictionary<string, bool>>
+            {
+                ["B1"] = new Dictionary<string, bool>(),
+                ["B2"] = new Dictionary<string, bool>()
+            };
+
             // 1. 明文：随机 ASCII 文本
             string plaintext = GenerateRandomString(64);
             var plaintextBytes = Encoding.UTF8.GetBytes(plaintext);
@@ -6140,162 +6270,136 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                 foreach (var ver in versions)
                 {
                     Console.WriteLine($"----- 版本 {ver} ({encoding}) -----");
+                    bool overallSuccess = false;
 
                     try
                     {
                         if (ver == "V3" || ver == "V3S")
-                        {
-                            // 非对称加密测试
-                            TestAsymmetricEncryption(plaintextBytes, plaintext, ver, encoding);
-                        }
+                            overallSuccess = TestAsymmetricEncryption(plaintextBytes, plaintext, ver, encoding);
                         else
-                        {
-                            // 对称加密测试
-                            TestSymmetricEncryption(plaintextBytes, plaintext, password, ver, encoding);
-                        }
+                            overallSuccess = TestSymmetricEncryption(plaintextBytes, plaintext, password, ver, encoding);
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"模式 {ver} ({encoding}) 测试异常: {ex.Message}");
-                        Console.WriteLine("Status: FAILED\n");
+                        Console.WriteLine($"测试异常: {ex.Message}");
                     }
+
+                    // 记录结果
+                    results[encoding][ver] = overallSuccess;
+                    Console.WriteLine($"记录结果：{(overallSuccess ? "SUCCESS" : "FAILED")}\n");
                 }
                 Console.WriteLine();
             }
 
-            Console.WriteLine("======== 测试结束 ========");
+            // 5. 打印汇总表
+            Console.WriteLine("======== 测试汇总 ========");
+            Console.WriteLine($"模式  |   V0  |  V0.5 |   V1  |   V2  |   V3  |  V3S");
+            Console.WriteLine($"--------------------------------------------------");
+            foreach (var encoding in encodingModes)
+            {
+                var line = new StringBuilder();
+                line.Append(encoding.PadRight(5));
+                foreach (var ver in versions)
+                {
+                    var ok = results[encoding][ver] ? "S" : "F";
+                    line.Append($" |  {ok}   ");
+                }
+                Console.WriteLine(line.ToString());
+            }
+
+            // 6. 等待按键继续
+            Console.WriteLine("\n按任意键继续...");
+            Console.ReadKey();
         }
 
-        private static void TestSymmetricEncryption(byte[] plaintextBytes, string plaintext, string password, string version, string encoding)
+        private static bool TestSymmetricEncryption(
+            byte[] plaintextBytes,
+            string plaintext,
+            string password,
+            string version,
+            string encoding)
         {
+            bool success = false;
             try
             {
-                // 加密
+                // 调用你的对称加解密接口
                 var (cipher, debugInfo) = EncryptText(plaintextBytes, password.ToCharArray(), version);
+                Console.WriteLine($"密文长度: {cipher.Length}，前缀: {cipher.Substring(0, Math.Min(32, cipher.Length))}...");
 
-                if (string.IsNullOrEmpty(cipher))
-                {
-                    Console.WriteLine($"模式 {version} ({encoding}) 加密失败");
-                    Console.WriteLine("Status: FAILED\n");
-                    return;
-                }
-
-                Console.WriteLine($"密文长度: {cipher.Length} 字符");
-                Console.WriteLine($"密文前缀: {cipher.Substring(0, Math.Min(32, cipher.Length))}...");
-
-                // 解密
                 var (decryptedBytes, decryptDebugInfo) = DecryptText(cipher, password.ToCharArray());
                 string decryptedText = Encoding.UTF8.GetString(decryptedBytes);
 
-                bool success = decryptedText == plaintext;
+                success = decryptedText == plaintext;
                 Console.WriteLine($"解密校验: {(success ? "SUCCESS" : "FAILED")}");
-
                 if (!success)
-                {
-                    Console.WriteLine($"期望: {plaintext}");
-                    Console.WriteLine($"实际: {decryptedText}");
-                }
-
-                Console.WriteLine($"Status: {(success ? "SUCCESS" : "FAILED")}\n");
+                    Console.WriteLine($"期望[{plaintext}] 实际[{decryptedText}]");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"对称加密测试异常: {ex.Message}");
-                Console.WriteLine("Status: FAILED\n");
+                Console.WriteLine($"对称测试异常: {ex.Message}");
             }
+            return success;
         }
 
-        private static void TestAsymmetricEncryption(byte[] plaintextBytes, string plaintext, string version, string encoding)
+        private static bool TestAsymmetricEncryption(
+            byte[] plaintextBytes,
+            string plaintext,
+            string version,
+            string encoding)
         {
+            bool decryptSuccess = false, signatureValid = true;
+
             try
             {
-                // 生成密钥对
+                // 接收方 ECDH 密钥对
                 using var recipientEcdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP521);
                 string recipientPublicKey = Convert.ToBase64String(recipientEcdh.ExportSubjectPublicKeyInfo());
                 string recipientPrivateKey = Convert.ToBase64String(recipientEcdh.ExportPkcs8PrivateKey());
 
-                string cipher;
-                string debugInfo;
-
                 if (version == "V3S")
                 {
-                    // V3S 需要发送方密钥对用于签名
+                    // 发送方 ECDSA 密钥对
                     using var senderEcdsa = ECDsa.Create(ECCurve.NamedCurves.nistP521);
                     string senderPublicKey = Convert.ToBase64String(senderEcdsa.ExportSubjectPublicKeyInfo());
                     string senderPrivateKey = Convert.ToBase64String(senderEcdsa.ExportPkcs8PrivateKey());
 
-                    // 加密
+                    // 加密并签名
                     var encryptResult = EncryptTextV3S(plaintextBytes, recipientPublicKey, senderPrivateKey);
-                    cipher = encryptResult.encryptedText;
-                    debugInfo = encryptResult.debugInfo;
+                    Console.WriteLine($"密文长度: {encryptResult.encryptedText.Length}，前缀: {encryptResult.encryptedText.Substring(0, 32)}...");
 
-                    if (string.IsNullOrEmpty(cipher))
-                    {
-                        Console.WriteLine($"模式 {version} ({encoding}) 加密失败");
-                        Console.WriteLine("Status: FAILED\n");
-                        return;
-                    }
-
-                    Console.WriteLine($"密文长度: {cipher.Length} 字符");
-                    Console.WriteLine($"密文前缀: {cipher.Substring(0, Math.Min(32, cipher.Length))}...");
-
-                    // 解密并验证签名
-                    var (decryptedBytes, decryptDebugInfo, signatureStatus) = DecryptTextV3S(cipher, recipientPrivateKey, senderPublicKey);
+                    // 解密并验签
+                    var (decryptedBytes, decryptDebugInfo, signatureStatus) =
+                        DecryptTextV3S(encryptResult.encryptedText, recipientPrivateKey, senderPublicKey);
                     string decryptedText = Encoding.UTF8.GetString(decryptedBytes);
 
-                    bool decryptSuccess = decryptedText == plaintext;
-                    bool signatureValid = signatureStatus == "VALID";
+                    decryptSuccess = decryptedText == plaintext;
+                    signatureValid = (signatureStatus == "VALID");
 
                     Console.WriteLine($"解密校验: {(decryptSuccess ? "SUCCESS" : "FAILED")}");
                     Console.WriteLine($"签名验证: {signatureStatus}");
 
-                    if (!decryptSuccess)
-                    {
-                        Console.WriteLine($"期望: {plaintext}");
-                        Console.WriteLine($"实际: {decryptedText}");
-                    }
-
-                    bool overallSuccess = decryptSuccess && signatureValid;
-                    Console.WriteLine($"Status: {(overallSuccess ? "SUCCESS" : "FAILED")}\n");
+                    // 诊断：公钥长度
+                    Console.WriteLine($"[诊断] senderPublicKey 长度: {senderPublicKey.Length}");
                 }
-                else // V3
+                else
                 {
-                    // 加密
+                    // V3 纯非对称加密
                     var encryptResult = EncryptTextV3(plaintextBytes, recipientPublicKey);
-                    cipher = encryptResult.encryptedText;
-                    debugInfo = encryptResult.debugInfo;
+                    Console.WriteLine($"密文长度: {encryptResult.encryptedText.Length}，前缀: {encryptResult.encryptedText.Substring(0, 32)}...");
 
-                    if (string.IsNullOrEmpty(cipher))
-                    {
-                        Console.WriteLine($"模式 {version} ({encoding}) 加密失败");
-                        Console.WriteLine("Status: FAILED\n");
-                        return;
-                    }
-
-                    Console.WriteLine($"密文长度: {cipher.Length} 字符");
-                    Console.WriteLine($"密文前缀: {cipher.Substring(0, Math.Min(32, cipher.Length))}...");
-
-                    // 解密
-                    var (decryptedBytes, decryptDebugInfo) = DecryptTextV3(cipher, recipientPrivateKey);
+                    var (decryptedBytes, decryptDebugInfo) = DecryptTextV3(encryptResult.encryptedText, recipientPrivateKey);
                     string decryptedText = Encoding.UTF8.GetString(decryptedBytes);
 
-                    bool success = decryptedText == plaintext;
-                    Console.WriteLine($"解密校验: {(success ? "SUCCESS" : "FAILED")}");
-
-                    if (!success)
-                    {
-                        Console.WriteLine($"期望: {plaintext}");
-                        Console.WriteLine($"实际: {decryptedText}");
-                    }
-
-                    Console.WriteLine($"Status: {(success ? "SUCCESS" : "FAILED")}\n");
+                    decryptSuccess = decryptedText == plaintext;
+                    Console.WriteLine($"解密校验: {(decryptSuccess ? "SUCCESS" : "FAILED")}");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"非对称加密测试异常: {ex.Message}");
-                Console.WriteLine("Status: FAILED\n");
+                Console.WriteLine($"非对称测试异常: {ex.Message}");
             }
+
+            return (version == "V3S") ? (decryptSuccess && signatureValid) : decryptSuccess;
         }
 
         // 随机 ASCII 文本（包含大小写字母和数字）
@@ -6304,7 +6408,7 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
             const string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
             using var rng = RandomNumberGenerator.Create();
             var sb = new StringBuilder(len);
-            Span<byte> buf = stackalloc byte[1];
+            var buf = new byte[1];
             for (int i = 0; i < len; i++)
             {
                 rng.GetBytes(buf);
@@ -6312,6 +6416,195 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
             }
             return sb.ToString();
         }
+
+        public static void RunShell()
+        {
+            Console.WriteLine("TextCrypt Shell – 输入 /help 查看用法，直接输入 / 进入交互模式，空行退出\n");
+            while (true)
+            {
+                Console.Write("> ");
+                string? line = Console.ReadLine();
+                if (string.IsNullOrWhiteSpace(line)) break;  // 空行退出
+
+                var trimmed = line.Trim();
+                if (trimmed == "/")
+                {
+                    EnterSubShell();
+                    continue;
+                }
+
+                if (!trimmed.StartsWith("/")) continue;  // 普通文本忽略
+                try
+                {
+                    Execute(trimmed);
+                }
+                catch (Exception ex)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"[ERROR] {ex.Message}");
+                    Console.ResetColor();
+                }
+            }
+        }
+
+        /// <summary>子系统：提示符 #，输入 exit 返回主菜单。命令无需 '/'</summary>
+        private static void EnterSubShell()
+        {
+            Console.WriteLine("进入命令交互模式，输入 exit 返回主菜单（命令前缀 '/' 可省略）。");
+            while (true)
+            {
+                Console.Write("# ");
+                string? cmdLine = Console.ReadLine();
+                if (string.IsNullOrWhiteSpace(cmdLine)) continue;
+                var cmd = cmdLine.Trim();
+                if (cmd.Equals("exit", StringComparison.OrdinalIgnoreCase)) break;
+                // 支持带/或不带/的命令
+                string fullCmd = cmd.StartsWith("/") ? cmd : "/" + cmd;
+                try
+                {
+                    Execute(fullCmd);
+                }
+                catch (Exception ex)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"[ERROR] {ex.Message}");
+                    Console.ResetColor();
+                }
+            }
+        }
+
+        /// <summary>解析并执行单条命令。</summary>
+        public static void Execute(string rawCmd)
+        {
+            var tokens = Regex.Matches(rawCmd, @"[\""].+?[\""]|\S+")
+                              .Select(m => m.Value.Trim('"'))
+                              .ToList();
+            if (tokens.Count < 1) { Console.WriteLine("命令格式错误"); return; }
+
+            string verb = tokens[0].TrimStart('/').ToLowerInvariant();
+            switch (verb)
+            {
+                case "en": HandleEncrypt(tokens); break;
+                case "de": HandleDecrypt(tokens); break;
+                case "help": PrintHelp(); break;
+                default: Console.WriteLine($"未知命令: {verb}"); break;
+            }
+        }
+
+        #region /en 处理
+        private static void HandleEncrypt(IReadOnlyList<string> tk)
+        {
+            // /en <version> <pwd?> <plain?> [-pub <pub.pem>] [-pem <priv.pem>] [-out <file>]
+            if (tk.Count < 4) { Console.WriteLine("用法: /en <ver> <pwd> <plain> [...] "); return; }
+            string ver = tk[1].ToUpper();
+            string pwd = tk[2];
+            string plain = tk[3];
+
+            string? pubPath = GetParam(tk, "-pub");
+            string? pemPath = GetParam(tk, "-pem");
+            string? outPath = GetParam(tk, "-out");
+            string result;
+
+            if ((ver == "3" || ver == "3S") && pubPath == null)
+                throw new ArgumentException("V3/V3S 必须携带 -pub <公钥路径>");
+
+            switch (ver)
+            {
+                case "0":
+                case "0.5":
+                case "1":
+                case "2":
+                    result = Program.EncryptText(Encoding.UTF8.GetBytes(plain), pwd.ToCharArray(), $"V{ver}").encryptedText;
+                    break;
+                case "3":
+                    result = Program.EncryptTextV3(Encoding.UTF8.GetBytes(plain), File.ReadAllText(pubPath!)).encryptedText;
+                    break;
+                case "3S":
+                    if (pemPath == null)
+                        throw new ArgumentException("V3S 必须携带 -pem <私钥路径> 来签名");
+                    result = Program.EncryptTextV3S(Encoding.UTF8.GetBytes(plain),
+                                                    File.ReadAllText(pubPath!),
+                                                    File.ReadAllText(pemPath!)).encryptedText;
+                    break;
+                default: throw new ArgumentException($"不支持的版本: {ver}");
+            }
+
+            Output(result, outPath);
+        }
+        #endregion
+
+        #region /de 处理
+        private static void HandleDecrypt(IReadOnlyList<string> tk)
+        {
+            // /de <pwd> <cipher> | /de -pem <priv.pem> <cipher> [-out <file>]
+            string? pemPath = GetParam(tk, "-pem");
+            string? outPath = GetParam(tk, "-out");
+            string cipher, result;
+
+            if (pemPath == null)
+            {
+                if (tk.Count < 3) { Console.WriteLine("用法: /de <pwd> <cipher> [...] "); return; }
+                string pwd = tk[1];
+                cipher = tk[2];
+                byte[] plainBytes = Program.DecryptText(cipher, pwd.ToCharArray()).decryptedBytes;
+                result = Encoding.UTF8.GetString(plainBytes);
+            }
+            else
+            {
+                cipher = tk[^1];
+                string priv = File.ReadAllText(pemPath);
+                try
+                {
+                    byte[] p = Program.DecryptTextV3(cipher, priv).decryptedBytes;
+                    result = Encoding.UTF8.GetString(p);
+                }
+                catch
+                {
+                    byte[] p = Program.DecryptTextV3S(cipher, priv).decryptedBytes;
+                    result = Encoding.UTF8.GetString(p);
+                }
+            }
+
+            Output(result, outPath);
+        }
+        #endregion
+
+
+        #region 工具方法
+        private static string? GetParam(IReadOnlyList<string> tk, string flag)
+        {
+            int idx = tk.IndexOf(flag, StringComparer.OrdinalIgnoreCase);
+            return idx >= 0 && idx + 1 < tk.Count ? tk[idx + 1] : null;
+        }
+
+        private static void Output(string text, string? path)
+        {
+            if (path == null)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine(text);
+                Console.ResetColor();
+            }
+            else
+            {
+                File.WriteAllText(path, text, Encoding.UTF8);
+                Console.WriteLine($"已写入 {path}");
+            }
+        }
+
+        private static void PrintHelp()
+        {
+            Console.WriteLine("""
+        /en <ver> <pwd> <plain> [-pub <pub.pem>] [-pem <priv.pem>] [-out <file>]
+            ver = 0 | 0.5 | 1 | 2 | 3 | 3S
+            V3/V3S 必须 -pub 公钥路径，V3S 额外 -pem 私钥路径签名
+        /de <pwd> <cipher> [-out <file>]
+        /de -pem <priv.pem> <cipher> [-out <file>]
+        / 进入交互模式，exit 返回主菜单（命令前缀 '/' 可省略）
+        """);
+        }
+        #endregion
     }
+
 }
 
