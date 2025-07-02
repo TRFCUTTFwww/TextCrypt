@@ -987,7 +987,7 @@ ooooooooooooo                           .     .oooooo.                          
                         Run();
                         break;
                     case "/":
-                        RunShell();
+                        EnterSubShell();
                         break;
                     default:
                         Console.WriteLine("无效的选择，请重试。");
@@ -3083,6 +3083,7 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                     int argon2MemorySizeKB = CurrentConfig.MemorySizeKB;
                     int argon2Iterations = CurrentConfig.Iterations;
                     int argon2Parallelism = CurrentConfig.Parallelism;
+                    int nonceLen = TextCryptConfig.NonceLength;
 
                     salt = GenerateRandomBytes(16);
                     kek = DeriveKeyFromPassword(password, salt, 32, argon2MemorySizeKB, argon2Iterations, argon2Parallelism);
@@ -3130,21 +3131,14 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                         byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
                         byte[] nonceForV1 = GenerateRandomBytes(RANDOM_NONCE_LENGTH);
                         byte[] finalBytesToEncode = new byte[nonceForV1.Length + jsonBytes.Length];
+                        byte[] extNonce = nonceLen == 0 ? Array.Empty<byte>()
+                                                         : GenerateRandomBytes(nonceLen);
+                        byte[] toEncode = new byte[extNonce.Length + jsonBytes.Length];
                         Buffer.BlockCopy(nonceForV1, 0, finalBytesToEncode, 0, nonceForV1.Length);
                         Buffer.BlockCopy(jsonBytes, 0, finalBytesToEncode, nonceForV1.Length, jsonBytes.Length);
 
-                        if (TextCryptConfig.Base == "B1")
-                        {
-                            encryptedText = EncodeChunkWithOriginalAlgorithm(jsonBytes, shuffledCharset,
+                        encryptedText = EncodeChunkWithOriginalAlgorithm(jsonBytes, shuffledCharset,
                                                                          customBase);
-                        }
-                        else
-                        {
-                            encryptedText = EncodeInternal_Old(jsonBytes,
-                                                                             shuffledCharset,
-                                                                             customBase,chunkSize);
-
-                        }
 
                         debugInfo = DebugMode ? $@"加密参数 (双层加密 V1):
 - DEK (Base64): {Convert.ToBase64String(dek)} (Intermediate, not stored directly)
@@ -5534,6 +5528,12 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
             {
                 int chunkSize = DeriveChunkSize(password);
 
+                if (TryDecode(
+                        () => DecodeInternal_Old(ciphertext, shuffledCharset, map, customBase, chunkSize),
+                        out var bytesOld, "B2"))
+                {
+                    return bytesOld;
+                }
                 // 1) 新版分块
                 if (TryDecode(
         () => DecodeChunkWithOriginalAlgorithm(ciphertext, shuffledCharset, map, customBase),
@@ -5543,12 +5543,7 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                     return bytesNew;
                 }
                 // 2) 旧版 B2
-                if (TryDecode(
-                        () => DecodeInternal_Old(ciphertext, shuffledCharset, map, customBase, chunkSize),
-                        out var bytesOld,"B2"))
-                {
-                    return bytesOld;
-                }
+                
             }
 
             throw new InvalidOperationException(
@@ -5566,6 +5561,17 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
             int chunkSize)
         {
             if (TryDecode(
+                    () => DecodeInternal_Old(ciphertext, shuffledCharset, map, customBase, chunkSize),
+                    out var b2, "B2"))
+            {
+                if (DebugMode)
+                {
+                    Console.WriteLine($"[DEBUG]完整解码内容:{b2}");
+                }
+                return b2;
+            }
+
+            if (TryDecode(
                     () => DecodeChunkWithOriginalAlgorithm(ciphertext, shuffledCharset, map, customBase),
                     out var b1, "B1"))
             {
@@ -5576,16 +5582,7 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                 return b1;
                 
             }
-            if (TryDecode(
-                    () => DecodeInternal_Old(ciphertext, shuffledCharset, map, customBase, chunkSize),
-                    out var b2, "B2"))
-            {
-                if (DebugMode)
-                {
-                    Console.WriteLine($"[DEBUG]完整解码内容:{b2}");
-                }
-                return b2;
-            }
+            
             throw new FormatException("无法 Base-custom 解码");
         }
 
@@ -6486,11 +6483,56 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
             {
                 case "en": HandleEncrypt(tokens); break;
                 case "de": HandleDecrypt(tokens); break;
+                case "set": HandleSet(tokens); break;   // ★ 新增
                 case "help": PrintHelp(); break;
                 default: Console.WriteLine($"未知命令: {verb}"); break;
             }
         }
 
+        private static void HandleSet(IReadOnlyList<string> tk)
+        {
+            // /set <key> <value>
+            if (tk.Count != 3) { Console.WriteLine("用法: /set <key> <value>"); return; }
+
+            string key = tk[1].ToLowerInvariant();
+            string val = tk[2];
+
+            switch (key)
+            {
+                case "debug":
+                    if (val.Equals("t", StringComparison.OrdinalIgnoreCase) ||
+                        val.Equals("true", StringComparison.OrdinalIgnoreCase))
+                    {
+                        DebugMode = true;
+                    }
+                    else if (val.Equals("f", StringComparison.OrdinalIgnoreCase) ||
+                             val.Equals("false", StringComparison.OrdinalIgnoreCase))
+                    {
+                        DebugMode = false;
+                    }
+                    else { Console.WriteLine("debug 只能是 t/f"); return; }
+                    Console.WriteLine($"[CONFIG] DebugMode 已更新为 {DebugMode}");
+                    break;
+
+                case "base":
+                    TextCryptConfig.Base = val.ToUpper();
+                    Console.WriteLine($"[CONFIG] 编码模式 已更新为 {TextCryptConfig.Base}");
+                    break;
+
+                case "nonce":
+                    if (int.TryParse(val, out int n) && n >= 0)
+                    {
+                        TextCryptConfig.NonceLength = n;
+                        Console.WriteLine($"[CONFIG] NonceLength 已更新为 {TextCryptConfig.NonceLength}");
+                    }
+                    else Console.WriteLine("nonce 必须是非负整数");
+                    break;
+
+                default:
+                    Console.WriteLine($"未知配置键: {key}");
+                    break;
+            }
+        }
         #region /en 处理
         private static void HandleEncrypt(IReadOnlyList<string> tk)
         {
