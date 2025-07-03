@@ -3371,12 +3371,28 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
 
         static byte[] GenerateRandomBytes(int length)
         {
-            byte[] bytes = new byte[length];
-            using (RandomNumberGenerator rng = RandomNumberGenerator.Create())
+            // 62 个允许的字符
+            const string Pool = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+            byte[] result = new byte[length];          // 最终返回的字节，每个都是 Pool 里的 ASCII 码
+            Span<byte> buffer = stackalloc byte[128];  // 临时缓冲，比 length 小也行
+            using var rng = RandomNumberGenerator.Create();
+
+            int pos = 0;
+            while (pos < length)
             {
-                rng.GetBytes(bytes);
+                // 一次批量拿随机字节，减少系统调用
+                rng.GetBytes(buffer);
+
+                foreach (byte raw in buffer)
+                {
+                    if (raw >= 248) continue;          // 丢弃 248-255，保持严格均匀
+                    result[pos++] = (byte)Pool[raw % 62];
+                    if (pos == length) break;          // 填够所需长度就收工
+                }
             }
-            return bytes;
+
+            return result;
         }
 
         static byte[] DeriveKeyFromPassword(char[] password, byte[] salt, int keySize, int memorySizeKB, int iterations, int parallelism)
@@ -5401,39 +5417,43 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
             }
 
             // —— 1. 定位 JSON 块 ——
-            if (bytes == null || bytes.Length == 0)
-                return false;
+            // 从后往前扫描，把“最里层、已闭合”的 {…} 或 […] 取出来
+            int startIdx = -1, endIdx = -1;
+            byte openChar = 0, closeChar = 0;
 
-            int idxCurly = Array.IndexOf(bytes, (byte)'{');
-            int idxSquare = Array.IndexOf(bytes, (byte)'[');
-            int startIdx = -1;
-            char openChar = '\0', closeChar = '\0';
-            if (idxCurly >= 0 && (idxSquare < 0 || idxCurly < idxSquare))
+            // 记录所有 { 和 [ 的索引，倒序遍历以保证“最里面”
+            var openPositions = new List<int>();
+            for (int i = 0; i < bytes.Length; i++)
             {
-                startIdx = idxCurly;
-                openChar = '{'; closeChar = '}';
+                if (bytes[i] == (byte)'{' || bytes[i] == (byte)'[')
+                    openPositions.Add(i);
             }
-            else if (idxSquare >= 0)
-            {
-                startIdx = idxSquare;
-                openChar = '['; closeChar = ']';
-            }
-            if (startIdx < 0)
-                return false;
 
-            int depth = 0, endIdx = -1;
-            for (int i = startIdx; i < bytes.Length; i++)
+            for (int k = openPositions.Count - 1; k >= 0; k--)
             {
-                if (bytes[i] == (byte)openChar) depth++;
-                else if (bytes[i] == (byte)closeChar) depth--;
-                if (depth == 0)
+                int i = openPositions[k];
+                openChar = bytes[i];
+                closeChar = openChar == (byte)'{' ? (byte)'}' : (byte)']';
+
+                int depth = 0;
+                for (int j = i; j < bytes.Length; j++)
                 {
-                    endIdx = i;
-                    break;
+                    if (bytes[j] == openChar) depth++;
+                    else if (bytes[j] == closeChar) depth--;
+
+                    if (depth == 0)   // 找到了与当前 openChar 对应的 closeChar
+                    {
+                        startIdx = i;
+                        endIdx = j;
+                        break;
+                    }
                 }
+                if (depth == 0 && endIdx > startIdx)
+                    break;            // 已拿到“最内层闭合块”，退出循环
             }
-            if (endIdx < 0)
-                return false;
+
+            if (startIdx < 0 || endIdx < 0)
+                return false;         // 连闭合块都找不到
 
             var jsonBytes = bytes.Skip(startIdx).Take(endIdx - startIdx + 1).ToArray();
 
