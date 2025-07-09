@@ -989,8 +989,13 @@ ooooooooooooo                           .     .oooooo.                          
                     case "/":
                         EnterSubShell();
                         break;
+                    case string s when s.StartsWith("/") && s.Length > 1:
+                        Execute(choice);
+                        Console.Write("按下回车继续...");
+                        Console.ReadKey();
+                        break;
                     default:
-                        Console.WriteLine("无效的选择，请重试。");
+                        
                         break;
                 }
             }
@@ -6491,7 +6496,7 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
         }
 
         /// <summary>解析并执行单条命令。</summary>
-        public static void Execute(string rawCmd)
+        private static void Execute(string rawCmd)
         {
             var tokens = Regex.Matches(rawCmd, @"[\""].+?[\""]|\S+")
                               .Select(m => m.Value.Trim('"'))
@@ -6503,7 +6508,8 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
             {
                 case "en": HandleEncrypt(tokens); break;
                 case "de": HandleDecrypt(tokens); break;
-                case "set": HandleSet(tokens); break;   // ★ 新增
+                case "set": HandleSet(tokens); break;
+                case "list": HandleList(tokens); break;   // ★ 新增
                 case "help": PrintHelp(); break;
                 default: Console.WriteLine($"未知命令: {verb}"); break;
             }
@@ -6512,6 +6518,11 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
         private static void HandleSet(IReadOnlyList<string> tk)
         {
             // /set <key> <value>
+            if (tk.Count == 2 && tk[1].Equals("list", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine($"Nonce:{TextCryptConfig.NonceLength}\nBase方法:{TextCryptConfig.Base}");
+                return;
+            }
             if (tk.Count != 3) { Console.WriteLine("用法: /set <key> <value>"); return; }
 
             string key = tk[1].ToLowerInvariant();
@@ -6556,19 +6567,21 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
         #region /en 处理
         private static void HandleEncrypt(IReadOnlyList<string> tk)
         {
-            // /en <version> <pwd?> <plain?> [-pub <pub.pem>] [-pem <priv.pem>] [-out <file>]
-            if (tk.Count < 4) { Console.WriteLine("用法: /en <ver> <pwd> <plain> [...] "); return; }
-            string ver = tk[1].ToUpper();
-            string pwd = tk[2];
-            string plain = tk[3];
+            if (tk.Count < 3) { Console.WriteLine("用法: /en <ver> [<pwd>] <plain> [...] "); return; }
 
-            string? pubPath = GetParam(tk, "-pub");
-            string? pemPath = GetParam(tk, "-pem");
-            string? outPath = GetParam(tk, "-out");
-            string result;
+            string ver = tk[1].ToUpperInvariant();
 
-            if ((ver == "3" || ver == "3S") && pubPath == null)
-                throw new ArgumentException("V3/V3S 必须携带 -pub <公钥路径>");
+            // —— 将位置参数与选项参数分离 ——
+            int firstOpt = tk.Skip(2).ToList().FindIndex(t => t.StartsWith("-"));
+            firstOpt = firstOpt < 0 ? tk.Count : firstOpt + 2;
+
+            var posArgs = tk.Skip(2).Take(firstOpt - 2).ToList(); // 位置参数
+            var opts = tk.Skip(firstOpt).ToList();             // 选项及其值
+
+            string? pubPath = GetParam(opts, "-pub");
+            string? pemPath = GetParam(opts, "-pem");
+            string? outPath = GetParam(opts, "-out");
+            string result, plain, pwd;
 
             switch (ver)
             {
@@ -6576,23 +6589,49 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
                 case "0.5":
                 case "1":
                 case "2":
-                    result = Program.EncryptText(Encoding.UTF8.GetBytes(plain), pwd.ToCharArray(), $"V{ver}").encryptedText;
+                    if (posArgs.Count != 2)
+                    {
+                        Console.WriteLine("用法: /en <ver> <pwd> <plain> [...]");
+                        return;
+                    }
+                    pwd = posArgs[0];
+                    plain = posArgs[1];
+                    result = Program.EncryptText(Encoding.UTF8.GetBytes(plain),
+                                                  pwd.ToCharArray(),
+                                                  $"V{ver}").encryptedText;
                     break;
+
                 case "3":
-                    result = Program.EncryptTextV3(Encoding.UTF8.GetBytes(plain), File.ReadAllText(pubPath!)).encryptedText;
+                    if (posArgs.Count != 1 || pubPath == null)
+                    {
+                        Console.WriteLine("用法: /en 3 <plain> -pub <pub.pem> [...]");
+                        return;
+                    }
+                    plain = posArgs[0];
+                    result = Program.EncryptTextV3(Encoding.UTF8.GetBytes(plain),
+                                                   File.ReadAllText(pubPath)).encryptedText;
                     break;
+
                 case "3S":
-                    if (pemPath == null)
-                        throw new ArgumentException("V3S 必须携带 -pem <私钥路径> 来签名");
+                    if (posArgs.Count != 1 || pubPath == null || pemPath == null)
+                    {
+                        Console.WriteLine("用法: /en 3S <plain> -pub <pub.pem> -pem <priv.pem> [...]");
+                        return;
+                    }
+                    plain = posArgs[0];
                     result = Program.EncryptTextV3S(Encoding.UTF8.GetBytes(plain),
-                                                    File.ReadAllText(pubPath!),
-                                                    File.ReadAllText(pemPath!)).encryptedText;
+                                                    File.ReadAllText(pubPath),
+                                                    File.ReadAllText(pemPath)).encryptedText;
                     break;
-                default: throw new ArgumentException($"不支持的版本: {ver}");
+
+                default:
+                    Console.WriteLine($"不支持的版本: {ver}");
+                    return;
             }
 
             Output(result, outPath);
         }
+
         #endregion
 
         #region /de 处理
@@ -6630,6 +6669,40 @@ AES Key (HKDF)    : {Convert.ToBase64String(aesKey)}
             Output(result, outPath);
         }
         #endregion
+        /// <summary>/list [dir]  列出目录下的 *.pub/*.pem 文件</summary>
+        private static void HandleList(IReadOnlyList<string> tk)
+        {
+            string dir = tk.Count >= 2 ? tk[1] : Directory.GetCurrentDirectory();
+            if (!Directory.Exists(dir))
+            {
+                Console.WriteLine($"目录不存在: {dir}");
+                return;
+            }
+
+            var files = Directory.EnumerateFiles(dir, "*.*", SearchOption.TopDirectoryOnly)
+                                 .Where(f => f.EndsWith(".pub", StringComparison.OrdinalIgnoreCase) ||
+                                             f.EndsWith(".pem", StringComparison.OrdinalIgnoreCase))
+                                 .Select(Path.GetFileName)
+                                 .OrderBy(f => f)
+                                 .ToList();
+
+            if (files.Count == 0)
+            {
+                Console.WriteLine("未找到任何 .pub/.pem 文件");
+                return;
+            }
+
+            foreach (var f in files)
+            {
+                if (f.EndsWith(".pub", StringComparison.OrdinalIgnoreCase))
+                    Console.ForegroundColor = ConsoleColor.Blue;   // 公钥 .pub → 蓝色
+                else
+                    Console.ForegroundColor = ConsoleColor.Green;  // 私钥 .pem → 绿色
+
+                Console.WriteLine(f);
+            }
+            Console.ResetColor();
+        }
 
 
         #region 工具方法
